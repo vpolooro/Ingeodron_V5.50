@@ -101,10 +101,19 @@ export function cadTransformToPlanBounds(cadTransform: CadTransform): PlanCoordi
   return { minE, maxE, minN, maxN, source: 'model3d' };
 }
 
+export interface Load3DProgressInfo {
+  percent: number | null;
+  loadedBytes: number;
+  totalBytes: number | null;
+  stage: 'downloading' | 'parsing' | 'geometry' | 'finalizing';
+  stageLabel: string;
+}
+
 export interface Load3DAssetOptions {
   maxPoints?: number;
   pointSize?: number;
   maxAnisotropy?: number;
+  onProgress?: (info: Load3DProgressInfo) => void;
 }
 
 export interface Loaded3DAssetResult {
@@ -205,10 +214,25 @@ function appendPointCloudChunk(
   contentHolder.add(new THREE.Points(geom, material));
 }
 
+function yieldToUiFrame(): Promise<void> {
+  if (typeof requestAnimationFrame === 'function') {
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  }
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 async function readResponseAsChunks(
   resp: Response,
-  onChunk: (chunk: Uint8Array) => boolean | void
+  onChunk: (chunk: Uint8Array) => boolean | void,
+  onBytesProgress?: (loadedBytes: number, totalBytes: number | null) => void
 ): Promise<void> {
+  const rawLen = Number(resp.headers.get('content-length')) || 0;
+  const totalBytes = rawLen > 0 ? rawLen : null;
+  let loadedBytes = 0;
+  let lastEmitMs = 0;
+
+  onBytesProgress?.(0, totalBytes);
+
   if (resp.body) {
     const reader = resp.body.getReader();
     try {
@@ -216,6 +240,12 @@ async function readResponseAsChunks(
         const { value, done } = await reader.read();
         if (done) break;
         if (value && value.byteLength > 0) {
+          loadedBytes += value.byteLength;
+          const now = Date.now();
+          if (now - lastEmitMs >= 60) {
+            lastEmitMs = now;
+            onBytesProgress?.(loadedBytes, totalBytes);
+          }
           const shouldStop = onChunk(value);
           if (shouldStop === true) {
             await reader.cancel().catch(() => {});
@@ -226,24 +256,70 @@ async function readResponseAsChunks(
     } finally {
       reader.releaseLock();
     }
+    onBytesProgress?.(loadedBytes, totalBytes ?? (loadedBytes > 0 ? loadedBytes : null));
     return;
   }
   const buf = await resp.arrayBuffer();
-  onChunk(new Uint8Array(buf));
+  const u8 = new Uint8Array(buf);
+  loadedBytes = u8.byteLength;
+  onBytesProgress?.(loadedBytes, totalBytes ?? (loadedBytes > 0 ? loadedBytes : null));
+  onChunk(u8);
+}
+
+async function readResponseBufferWithProgress(
+  resp: Response,
+  onBytesProgress?: (loadedBytes: number, totalBytes: number | null) => void
+): Promise<{ buffer: ArrayBuffer; loadedBytes: number; totalBytes: number | null }> {
+  const chunks: Uint8Array[] = [];
+  let totalLen = 0;
+  const rawLen = Number(resp.headers.get('content-length')) || 0;
+  const headerTotal = rawLen > 0 ? rawLen : null;
+
+  await readResponseAsChunks(
+    resp,
+    (chunk) => {
+      chunks.push(chunk);
+      totalLen += chunk.byteLength;
+    },
+    onBytesProgress
+  );
+
+  if (chunks.length === 1 && chunks[0].byteOffset === 0 && chunks[0].byteLength === chunks[0].buffer.byteLength) {
+    return {
+      buffer: chunks[0].buffer as ArrayBuffer,
+      loadedBytes: totalLen,
+      totalBytes: headerTotal ?? (totalLen > 0 ? totalLen : null),
+    };
+  }
+
+  const merged = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return {
+    buffer: merged.buffer,
+    loadedBytes: totalLen,
+    totalBytes: headerTotal ?? (totalLen > 0 ? totalLen : null),
+  };
 }
 
 async function parseAsciiPointCloudStream(
   resp: Response,
   contentHolder: THREE.Group,
   material: THREE.PointsMaterial,
-  maxPoints = MAX_SUPPORTED_POINTS
-): Promise<{ totalPointsLoaded: number; totalFilePoints: number; origin: THREE.Vector3 }> {
+  maxPoints = MAX_SUPPORTED_POINTS,
+  onBytesProgress?: (loadedBytes: number, totalBytes: number | null) => void
+): Promise<{ totalPointsLoaded: number; totalFilePoints: number; origin: THREE.Vector3; loadedBytes: number; totalBytes: number | null }> {
   const effectiveMax = Math.min(
     MAX_SUPPORTED_POINTS,
     maxPoints <= 0 ? MAX_SUPPORTED_POINTS : maxPoints
   );
   const contentLength = Number(resp.headers.get('content-length')) || 0;
   const decoder = new TextDecoder('utf-8');
+  let finalLoadedBytes = 0;
+  let finalTotalBytes: number | null = contentLength > 0 ? contentLength : null;
 
   let tail = '';
   let stride = 1;
@@ -361,6 +437,10 @@ async function parseAsciiPointCloudStream(
     }
     tail = textChunk.slice(start);
     return false;
+  }, (loadedBytes, totalBytes) => {
+    finalLoadedBytes = loadedBytes;
+    finalTotalBytes = totalBytes;
+    onBytesProgress?.(loadedBytes, totalBytes);
   });
 
   const finalTail = tail + decoder.decode();
@@ -377,6 +457,8 @@ async function parseAsciiPointCloudStream(
     totalPointsLoaded: totalSampled,
     totalFilePoints: stride === 1 ? totalSampled : Math.max(totalSampled, totalValidLines),
     origin: new THREE.Vector3(originX, originY, originZ),
+    loadedBytes: finalLoadedBytes,
+    totalBytes: finalTotalBytes,
   };
 }
 
@@ -384,13 +466,16 @@ async function parseBinaryLasStream(
   resp: Response,
   contentHolder: THREE.Group,
   material: THREE.PointsMaterial,
-  maxPoints = MAX_SUPPORTED_POINTS
-): Promise<{ totalPointsLoaded: number; totalFilePoints: number; origin: THREE.Vector3 }> {
+  maxPoints = MAX_SUPPORTED_POINTS,
+  onBytesProgress?: (loadedBytes: number, totalBytes: number | null) => void
+): Promise<{ totalPointsLoaded: number; totalFilePoints: number; origin: THREE.Vector3; loadedBytes: number; totalBytes: number | null }> {
   const effectiveMax = Math.min(
     MAX_SUPPORTED_POINTS,
     maxPoints <= 0 ? MAX_SUPPORTED_POINTS : maxPoints
   );
   const contentLength = Number(resp.headers.get('content-length')) || 0;
+  let finalLoadedBytes = 0;
+  let finalTotalBytes: number | null = contentLength > 0 ? contentLength : null;
 
   let pending = new Uint8Array(0);
   let headerParsed = false;
@@ -628,6 +713,10 @@ async function parseBinaryLasStream(
     const remLen = merged.byteLength - consumed;
     pending = remLen > 0 ? merged.slice(consumed) : new Uint8Array(0);
     return false;
+  }, (loadedBytes, totalBytes) => {
+    finalLoadedBytes = loadedBytes;
+    finalTotalBytes = totalBytes;
+    onBytesProgress?.(loadedBytes, totalBytes);
   });
 
   if (pending.byteLength > 0 && (!probeDone || (recordIdx < totalRecords && totalSampled < effectiveMax))) {
@@ -643,6 +732,8 @@ async function parseBinaryLasStream(
     totalPointsLoaded: totalSampled,
     totalFilePoints: totalRecords,
     origin: new THREE.Vector3(originX, originY, originZ),
+    loadedBytes: finalLoadedBytes,
+    totalBytes: finalTotalBytes,
   };
 }
 
@@ -662,6 +753,24 @@ export async function load3DAssetFromUrl(
   const maxPoints = options.maxPoints ?? MAX_SUPPORTED_POINTS;
   const initialPointSize = options.pointSize ?? 1.0;
   const maxAnisotropy = Math.max(1, options.maxAnisotropy ?? 8);
+  const onProgress = options.onProgress;
+
+  let lastKnownLoadedBytes = 0;
+  let lastKnownTotalBytes: number | null = null;
+
+  const emitProgress = (info: Load3DProgressInfo) => {
+    lastKnownLoadedBytes = info.loadedBytes;
+    lastKnownTotalBytes = info.totalBytes;
+    onProgress?.(info);
+  };
+
+  emitProgress({
+    percent: 2,
+    loadedBytes: 0,
+    totalBytes: null,
+    stage: 'downloading',
+    stageLabel: 'Conectando con el servidor...',
+  });
 
   const resp = await fetch(url);
   if (!resp.ok) {
@@ -692,21 +801,83 @@ export async function load3DAssetFromUrl(
     material: THREE.PointsMaterial;
   }> = [];
 
+  const handleBufferDownloadProgress = (loadedBytes: number, totalBytes: number | null) => {
+    const pct =
+      totalBytes && totalBytes > 0
+        ? Math.min(72, Math.max(3, Math.round((loadedBytes / totalBytes) * 72)))
+        : null;
+    emitProgress({
+      percent: pct,
+      loadedBytes,
+      totalBytes,
+      stage: 'downloading',
+      stageLabel: 'Descargando modelo 3D...',
+    });
+  };
+
+  const handleStreamDownloadProgress = (loadedBytes: number, totalBytes: number | null) => {
+    const pct =
+      totalBytes && totalBytes > 0
+        ? Math.min(88, Math.max(3, Math.round((loadedBytes / totalBytes) * 88)))
+        : null;
+    emitProgress({
+      percent: pct,
+      loadedBytes,
+      totalBytes,
+      stage: 'downloading',
+      stageLabel: 'Descargando y procesando nube de puntos...',
+    });
+  };
+
   if (ext === '.glb' || ext === '.gltf') {
     defaultZUp = false;
-    const buf = await resp.arrayBuffer();
+    const { buffer, loadedBytes, totalBytes } = await readResponseBufferWithProgress(
+      resp,
+      handleBufferDownloadProgress
+    );
+    emitProgress({
+      percent: 76,
+      loadedBytes,
+      totalBytes,
+      stage: 'parsing',
+      stageLabel: 'Procesando malla GLTF / GLB...',
+    });
+    await yieldToUiFrame();
     const loader = new GLTFLoader();
-    const gltf = await loader.parseAsync(buf, '');
+    const gltf = await loader.parseAsync(buffer, '');
     contentHolder.add(gltf.scene);
   } else if (ext === '.obj') {
-    const text = await resp.text();
+    const { buffer, loadedBytes, totalBytes } = await readResponseBufferWithProgress(
+      resp,
+      handleBufferDownloadProgress
+    );
+    emitProgress({
+      percent: 76,
+      loadedBytes,
+      totalBytes,
+      stage: 'parsing',
+      stageLabel: 'Procesando geometría OBJ...',
+    });
+    await yieldToUiFrame();
+    const text = new TextDecoder('utf-8').decode(buffer);
     const loader = new OBJLoader();
     const obj = loader.parse(text);
     contentHolder.add(obj);
   } else if (ext === '.stl') {
-    const buf = await resp.arrayBuffer();
+    const { buffer, loadedBytes, totalBytes } = await readResponseBufferWithProgress(
+      resp,
+      handleBufferDownloadProgress
+    );
+    emitProgress({
+      percent: 76,
+      loadedBytes,
+      totalBytes,
+      stage: 'parsing',
+      stageLabel: 'Procesando malla STL...',
+    });
+    await yieldToUiFrame();
     const loader = new STLLoader();
-    const geom = loader.parse(buf);
+    const geom = loader.parse(buffer);
     geom.computeVertexNormals();
     const mat = new THREE.MeshStandardMaterial({
       color: '#cbd5e1',
@@ -715,9 +886,20 @@ export async function load3DAssetFromUrl(
     });
     contentHolder.add(new THREE.Mesh(geom, mat));
   } else if (ext === '.ply') {
-    const buf = await resp.arrayBuffer();
+    const { buffer, loadedBytes, totalBytes } = await readResponseBufferWithProgress(
+      resp,
+      handleBufferDownloadProgress
+    );
+    emitProgress({
+      percent: 76,
+      loadedBytes,
+      totalBytes,
+      stage: 'parsing',
+      stageLabel: 'Procesando geometría PLY...',
+    });
+    await yieldToUiFrame();
     const loader = new PLYLoader();
-    const geom = loader.parse(buf);
+    const geom = loader.parse(buffer);
     if (geom.index || (geom.attributes.normal && geom.attributes.position.count > 0 && !geom.attributes.color)) {
       geom.computeVertexNormals();
       const mat = new THREE.MeshStandardMaterial({
@@ -747,14 +929,33 @@ export async function load3DAssetFromUrl(
       map: pointSpriteTex,
       alphaTest: 0.5,
     });
-    const parsed = await parseAsciiPointCloudStream(resp, contentHolder, mat, maxPoints);
+    const parsed = await parseAsciiPointCloudStream(
+      resp,
+      contentHolder,
+      mat,
+      maxPoints,
+      handleStreamDownloadProgress
+    );
     totalSourcePoints = parsed.totalFilePoints;
     sourceOrigin.copy(parsed.origin);
+    lastKnownLoadedBytes = parsed.loadedBytes;
+    lastKnownTotalBytes = parsed.totalBytes;
   } else if (ext === '.pcd') {
     kind = 'pointcloud';
-    const buf = await resp.arrayBuffer();
+    const { buffer, loadedBytes, totalBytes } = await readResponseBufferWithProgress(
+      resp,
+      handleBufferDownloadProgress
+    );
+    emitProgress({
+      percent: 76,
+      loadedBytes,
+      totalBytes,
+      stage: 'parsing',
+      stageLabel: 'Procesando nube de puntos PCD...',
+    });
+    await yieldToUiFrame();
     const loader = new PCDLoader();
-    const pts = loader.parse(buf);
+    const pts = loader.parse(buffer);
     const mat = pts.material as THREE.PointsMaterial;
     mat.size = initialPointSize;
     mat.sizeAttenuation = true;
@@ -771,9 +972,17 @@ export async function load3DAssetFromUrl(
       map: pointSpriteTex,
       alphaTest: 0.5,
     });
-    const parsed = await parseBinaryLasStream(resp, contentHolder, mat, maxPoints);
+    const parsed = await parseBinaryLasStream(
+      resp,
+      contentHolder,
+      mat,
+      maxPoints,
+      handleStreamDownloadProgress
+    );
     totalSourcePoints = parsed.totalFilePoints;
     sourceOrigin.copy(parsed.origin);
+    lastKnownLoadedBytes = parsed.loadedBytes;
+    lastKnownTotalBytes = parsed.totalBytes;
   } else if (ext === '.csv' || ext === '.txt' || ext === '.pts') {
     kind = 'pointcloud';
     const mat = new THREE.PointsMaterial({
@@ -783,9 +992,17 @@ export async function load3DAssetFromUrl(
       map: pointSpriteTex,
       alphaTest: 0.5,
     });
-    const parsed = await parseAsciiPointCloudStream(resp, contentHolder, mat, maxPoints);
+    const parsed = await parseAsciiPointCloudStream(
+      resp,
+      contentHolder,
+      mat,
+      maxPoints,
+      handleStreamDownloadProgress
+    );
     totalSourcePoints = parsed.totalFilePoints;
     sourceOrigin.copy(parsed.origin);
+    lastKnownLoadedBytes = parsed.loadedBytes;
+    lastKnownTotalBytes = parsed.totalBytes;
   } else {
     pointSpriteTex.dispose();
     throw new Error(`Extensión 3D no soportada (${ext}).`);
@@ -982,7 +1199,24 @@ export async function load3DAssetFromUrl(
     });
   };
 
+  emitProgress({
+    percent: 90,
+    loadedBytes: lastKnownLoadedBytes,
+    totalBytes: lastKnownTotalBytes,
+    stage: 'geometry',
+    stageLabel: 'Normalizando coordenadas, escala y colores...',
+  });
+  await yieldToUiFrame();
+
   applyTransformAndColors(defaultZUp);
+
+  emitProgress({
+    percent: 96,
+    loadedBytes: lastKnownLoadedBytes,
+    totalBytes: lastKnownTotalBytes,
+    stage: 'finalizing',
+    stageLabel: 'Subiendo escena a WebGL...',
+  });
 
   return {
     group: rootGroup,

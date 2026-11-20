@@ -52,6 +52,7 @@ import {
 } from '../utils/drawing3DOverlay.ts';
 import { exportProfile2DDxf, exportProfile3DDxf } from '../utils/dxfProfileExporter.ts';
 import { createDxfWorldMapper } from '../utils/dxfOverlayParser.ts';
+import type { ParsedDxfContours } from '../utils/dxfContourParser.ts';
 import type { PlanCoordinateBounds } from '../utils/threeFileLoader.ts';
 import type { FlightDxfOverlay, Quarry, Stockpile, Survey } from '../types.ts';
 import { formatDateEu } from '../utils/dateUtils.ts';
@@ -73,6 +74,10 @@ interface Quarry2DOrthophotoViewerProps {
   onToggleDxfOverlay?: () => void;
   dxfOpacity?: number;
   onChangeDxfOpacity?: (opacity: number) => void;
+  contourDxf?: ParsedDxfContours | null;
+  showDxfContours?: boolean;
+  onToggleDxfContours?: () => void;
+  contourDxfError?: string | null;
 }
 
 const ELEVATION_STOPS = [
@@ -119,6 +124,10 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
   onToggleDxfOverlay,
   dxfOpacity: controlledDxfOpacity,
   onChangeDxfOpacity,
+  contourDxf = null,
+  showDxfContours: controlledShowDxfContours,
+  onToggleDxfContours,
+  contourDxfError = null,
 }) => {
   const viewerWrapperRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
@@ -132,6 +141,19 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
   const [contourStepM, setContourStepM] = useState<1 | 5>(5);
   const [showUtmGrid, setShowUtmGrid] = useState<boolean>(true);
   const [dockOpen, setDockOpen] = useState<boolean>(true);
+
+  const contoursVisible = contourDxf
+    ? controlledShowDxfContours !== undefined
+      ? controlledShowDxfContours
+      : showContours
+    : showContours;
+  const toggleContours = () => {
+    if (contourDxf && onToggleDxfContours) {
+      onToggleDxfContours();
+    } else {
+      setShowContours((v) => !v);
+    }
+  };
 
   const [internalShowDxfOverlay, setInternalShowDxfOverlay] = useState<boolean>(true);
   const showDxfOverlay =
@@ -266,8 +288,14 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
     };
   }, [terrain]);
 
-  const zMinM = demElevationBounds.minM;
-  const zMaxM = demElevationBounds.maxM;
+  const zMinM =
+    contourDxf && contourDxf.bounds.maxZ > contourDxf.bounds.minZ
+      ? Math.round(contourDxf.bounds.minZ * 100) / 100
+      : demElevationBounds.minM;
+  const zMaxM =
+    contourDxf && contourDxf.bounds.maxZ > contourDxf.bounds.minZ
+      ? Math.round(contourDxf.bounds.maxZ * 100) / 100
+      : demElevationBounds.maxM;
   const zSpanM = Math.max(0.01, zMaxM - zMinM);
 
   const elevToBaseY = useCallback(
@@ -280,9 +308,31 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
     [zMinM]
   );
 
-  // Natural orthophoto dimensions & aspect-locked canvas / fitted viewport box
-  const imgWidth = Math.max(1, orthoNaturalSize?.width || customOrthoCanvas?.width || 800);
-  const imgHeight = Math.max(1, orthoNaturalSize?.height || customOrthoCanvas?.height || 800);
+  // Natural orthophoto (or standalone DXF bounds) dimensions & aspect-locked canvas
+  const { imgWidth, imgHeight } = useMemo(() => {
+    if (orthoNaturalSize?.width && orthoNaturalSize?.height) {
+      return {
+        imgWidth: Math.max(1, orthoNaturalSize.width),
+        imgHeight: Math.max(1, orthoNaturalSize.height),
+      };
+    }
+    if (customOrthoCanvas) {
+      return {
+        imgWidth: Math.max(1, customOrthoCanvas.width),
+        imgHeight: Math.max(1, customOrthoCanvas.height),
+      };
+    }
+    if (contourDxf && contourDxf.bounds.maxX > contourDxf.bounds.minX && contourDxf.bounds.maxY > contourDxf.bounds.minY) {
+      const spanX = contourDxf.bounds.maxX - contourDxf.bounds.minX;
+      const spanY = contourDxf.bounds.maxY - contourDxf.bounds.minY;
+      const rawAspect = Math.max(0.25, Math.min(4, spanX / spanY));
+      return rawAspect >= 1
+        ? { imgWidth: 1200, imgHeight: Math.max(300, Math.round(1200 / rawAspect)) }
+        : { imgWidth: Math.max(300, Math.round(1200 * rawAspect)), imgHeight: 1200 };
+    }
+    return { imgWidth: 800, imgHeight: 800 };
+  }, [orthoNaturalSize?.width, orthoNaturalSize?.height, customOrthoCanvas, contourDxf]);
+
   const imgAspect = imgWidth / imgHeight;
 
   const { canvasW, canvasH } = useMemo(() => {
@@ -388,17 +438,25 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    const src = baseLayer === 'hipsometria' ? hypsoBitmap : customOrthoCanvas || orthoBitmap;
     ctx.clearRect(0, 0, canvasW, canvasH);
+    if (!customOrthoCanvas && contourDxf && baseLayer !== 'hipsometria') {
+      const grad = ctx.createLinearGradient(0, 0, canvasW, canvasH);
+      grad.addColorStop(0, '#0a101d');
+      grad.addColorStop(1, '#0f172a');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, canvasW, canvasH);
+      return;
+    }
+    const src = baseLayer === 'hipsometria' ? hypsoBitmap : customOrthoCanvas || orthoBitmap;
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(src, 0, 0, canvasW, canvasH);
-  }, [baseLayer, customOrthoCanvas, orthoBitmap, hypsoBitmap, canvasW, canvasH]);
+  }, [baseLayer, customOrthoCanvas, contourDxf, orthoBitmap, hypsoBitmap, canvasW, canvasH]);
 
-  // Vector contours
+  // Vector contours (synthetic DEM fallback only when no contour DXF is uploaded)
   const contours = useMemo(
-    () => (showContours ? extractContours(terrain, contourStepM) : []),
-    [terrain, showContours, contourStepM]
+    () => (!contourDxf && contoursVisible ? extractContours(terrain, contourStepM) : []),
+    [contourDxf, terrain, contoursVisible, contourStepM]
   );
 
   // Fullscreen listeners & CSS fallback body scroll lock
@@ -592,6 +650,61 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
     },
     [mappedDxfPolygons, focusWorldPoint, zoom]
   );
+
+  // Projected uploaded Contour DXF polylines batched into crisp SVG <path> strings
+  const mappedContourDxfPaths = useMemo(() => {
+    if (!contourDxf || !contoursVisible || contourDxf.polylines.length === 0) return [];
+
+    const { minX, maxX, minY, maxY } = contourDxf.bounds;
+    const dxfSpanX = Math.max(1e-3, maxX - minX);
+    const dxfSpanY = Math.max(1e-3, maxY - minY);
+    const dxfMidX = (minX + maxX) * 0.5;
+    const dxfMidY = (minY + maxY) * 0.5;
+
+    const margin = Math.max(60, Math.max(planSystem.spanE, planSystem.spanN, dxfSpanX, dxfSpanY) * 0.55);
+    const overlapsPlan =
+      planSystem.source !== 'local' &&
+      maxX >= planSystem.minE - margin &&
+      minX <= planSystem.maxE + margin &&
+      maxY >= planSystem.minN - margin &&
+      minY <= planSystem.maxN + margin;
+
+    const fitScale = Math.min(planSystem.spanE / dxfSpanX, planSystem.spanN / dxfSpanY) * 0.94;
+
+    const mapPtToSvg = (px: number, py: number) => {
+      if (overlapsPlan) {
+        return worldToSvg(px - planSystem.centerE, -(py - planSystem.centerN));
+      }
+      return worldToSvg((px - dxfMidX) * fitScale, -(py - dxfMidY) * fitScale);
+    };
+
+    const groups = new Map<string, { color: string; isMaster: boolean; parts: string[] }>();
+    for (const poly of contourDxf.polylines) {
+      if (poly.points.length < 2) continue;
+      const key = `${poly.isMaster ? 'M' : 'm'}:${poly.color}`;
+      let grp = groups.get(key);
+      if (!grp) {
+        grp = { color: poly.color, isMaster: poly.isMaster, parts: [] };
+        groups.set(key, grp);
+      }
+      const cmds: string[] = [];
+      for (let i = 0; i < poly.points.length; i++) {
+        const pt = mapPtToSvg(poly.points[i].x, poly.points[i].y);
+        cmds.push(`${i === 0 ? 'M' : 'L'}${pt.x.toFixed(1)},${pt.y.toFixed(1)}`);
+      }
+      if (poly.closed && poly.points.length >= 3) {
+        cmds.push('Z');
+      }
+      grp.parts.push(cmds.join(''));
+    }
+
+    return Array.from(groups.values()).map((g, idx) => ({
+      key: `${idx}-${g.color}-${g.isMaster ? 'M' : 'm'}`,
+      color: g.color,
+      isMaster: g.isMaster,
+      d: g.parts.join(' '),
+    }));
+  }, [contourDxf, contoursVisible, planSystem, worldToSvg]);
 
   // Update shape helper
   const updateShape = useCallback((id: string, patch: Partial<DrawnShape3D>) => {
@@ -1245,8 +1358,24 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
               </g>
             )}
 
-            {/* Vector Contour Lines */}
-            {showContours &&
+            {/* Uploaded Contour DXF Vector Overlay */}
+            {contoursVisible &&
+              mappedContourDxfPaths.map((group) => (
+                <path
+                  key={group.key}
+                  d={group.d}
+                  fill="none"
+                  stroke={group.color}
+                  strokeOpacity={group.isMaster ? 0.94 : 0.72}
+                  strokeWidth={(group.isMaster ? 1.55 : 0.95) * invScale}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              ))}
+
+            {/* Fallback Synthetic Vector Contour Lines */}
+            {contoursVisible &&
+              !contourDxf &&
               contours.map((seg, idx) => {
                 const a = worldToSvg(seg.x1, seg.z1);
                 const b = worldToSvg(seg.x2, seg.z2);
@@ -1714,7 +1843,7 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
               <Compass className="w-4 h-4 text-cyan-400 shrink-0" />
               <div className="min-w-0">
                 <div className="text-xs font-bold text-white truncate">
-                  {quarry?.name || 'Ortofoto Georreferenciada'}
+                  {quarry?.name || (contourDxf && !customOrthoCanvas ? contourDxf.fileName : 'Ortofoto Georreferenciada')}
                 </div>
                 <div className="text-[10px] font-mono text-gray-400 truncate">
                   {activeFlight
@@ -1723,6 +1852,18 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
                 </div>
               </div>
             </div>
+
+            {contourDxf && (
+              <div className="mt-1.5 text-[10px] font-mono text-amber-300/90 truncate" title={contourDxf.fileName}>
+                Curvado DXF: {contourDxf.fileName} ({formatEsInt(contourDxf.polylines.length)} curvas)
+              </div>
+            )}
+
+            {contourDxfError && (
+              <div className="mt-1.5 text-[10px] text-amber-300 bg-amber-500/10 border border-amber-500/35 rounded px-2 py-1">
+                {contourDxfError}
+              </div>
+            )}
 
             <div className="mt-2 pt-2 border-t border-gray-800/80 flex items-center justify-between gap-2 text-[10px]">
               <span className="text-gray-400 font-semibold whitespace-nowrap">Cota Z (auto):</span>
@@ -2661,16 +2802,23 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
                   </span>
                   <button
                     type="button"
-                    onClick={() => setShowContours((v) => !v)}
+                    onClick={toggleContours}
                     className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition cursor-pointer ${
-                      showContours
+                      contoursVisible
                         ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
                         : 'bg-[#111827] text-gray-400 hover:text-white border-gray-800'
                     }`}
+                    title={
+                      contourDxf
+                        ? `Mostrar u ocultar curvado DXF (${contourDxf.fileName})`
+                        : 'Mostrar u ocultar curvas de nivel'
+                    }
                   >
-                    Curvas
+                    {contourDxf
+                      ? `Curvado DXF (${formatEsInt(contourDxf.polylines.length)})`
+                      : 'Curvas'}
                   </button>
-                  {showContours && (
+                  {contoursVisible && !contourDxf && (
                     <button
                       type="button"
                       onClick={() => setContourStepM((s) => (s === 5 ? 1 : 5))}

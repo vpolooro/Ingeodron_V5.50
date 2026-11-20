@@ -362,9 +362,11 @@ export const FlightDxfManager: React.FC<FlightDxfManagerProps> = ({
               <span>Perímetros y Superficies 3D por Vuelo (.DXF)</span>
             </h3>
             <p className="text-xs text-gray-400">
-              Sube un archivo <span className="font-mono text-cyan-300">.DXF</span> por cada vuelo con las superficies 3D de las zonas de acopio delimitadas por sus polígonos. Asigna a cada polígono su{' '}
-              <span className="text-amber-300 font-semibold">color identificador</span> y el{' '}
-              <span className="text-emerald-300 font-semibold">acopio correspondiente</span> para superponerlo en los visores 2D y 3D.
+              Sube aquí un <span className="font-mono text-cyan-300">.DXF</span> por vuelo con los polígonos cerrados de las zonas de acopio para asignar su{' '}
+              <span className="text-amber-300 font-semibold">color identificador</span> y{' '}
+              <span className="text-emerald-300 font-semibold">acopio</span>. Si deseas cargar un{' '}
+              <span className="text-amber-300 font-semibold">DXF de curvado (curvas de nivel)</span> en ambos visores 3D y 2D, súbelo en{' '}
+              <span className="text-white font-semibold">Entregables → Curvas de Nivel (DXF)</span>.
             </p>
           </div>
 

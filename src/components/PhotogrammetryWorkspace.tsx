@@ -14,6 +14,7 @@ import {
   Plane,
   RefreshCw,
   Upload,
+  Waves,
 } from 'lucide-react';
 import { Quarry3DViewer, type External3DSource } from './Quarry3DViewer.tsx';
 import { Quarry2DOrthophotoViewer } from './Quarry2DOrthophotoViewer.tsx';
@@ -27,6 +28,12 @@ import {
   type LoadedOrthophotoResult,
   type PlanCoordinateBounds,
 } from '../utils/threeFileLoader.ts';
+import {
+  isSupportedContourDxfFileName,
+  loadDxfContoursFromUrl,
+  type DxfContourProgressInfo,
+  type ParsedDxfContours,
+} from '../utils/dxfContourParser.ts';
 import type { Deliverable, FlightDxfOverlay, Quarry, Stockpile, Survey, Zone } from '../types.ts';
 import { formatDateEu } from '../utils/dateUtils.ts';
 
@@ -118,35 +125,61 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     [quarryScopedDeliverables, activeFlight?.id]
   );
 
+  const compatibleContourDxfDeliverables = useMemo(
+    () =>
+      sortDeliverablesForContext(
+        quarryScopedDeliverables.filter(
+          (d) => d.category === 'contour_dxf' || isSupportedContourDxfFileName(d.fileName)
+        ),
+        activeFlight?.id
+      ),
+    [quarryScopedDeliverables, activeFlight?.id]
+  );
+
   const [selected3DKey, setSelected3DKey] = useState<string>('');
   const [selectedOrthoKey, setSelectedOrthoKey] = useState<string>('');
+  const [selectedContourDxfKey, setSelectedContourDxfKey] = useState<string>('');
   const [local3DPreview, setLocal3DPreview] = useState<External3DSource | null>(null);
   const [localOrthoFile, setLocalOrthoFile] = useState<{ url: string; fileName: string } | null>(null);
+  const [localContourDxfFile, setLocalContourDxfFile] = useState<{ url: string; fileName: string } | null>(null);
   const [loadedOrthophoto, setLoadedOrthophoto] = useState<LoadedOrthophotoResult | null>(null);
+  const [loadedContourDxf, setLoadedContourDxf] = useState<ParsedDxfContours | null>(null);
   const [loaded3DCadTransform, setLoaded3DCadTransform] = useState<CadTransform | null>(null);
   const [orthoLoading, setOrthoLoading] = useState<boolean>(false);
   const [orthoError, setOrthoError] = useState<string | null>(null);
   const [orthoReloadTick, setOrthoReloadTick] = useState<number>(0);
+  const [contourDxfLoading, setContourDxfLoading] = useState<boolean>(false);
+  const [contourDxfProgress, setContourDxfProgress] = useState<DxfContourProgressInfo | null>(null);
+  const [contourDxfError, setContourDxfError] = useState<string | null>(null);
+  const [showDxfContours, setShowDxfContours] = useState<boolean>(true);
   const [localHintError, setLocalHintError] = useState<string | null>(null);
   const [localSuccessNotice, setLocalSuccessNotice] = useState<string | null>(null);
 
   const lastFlightId3DRef = useRef<number | undefined>(activeFlight?.id);
   const lastFlightIdOrthoRef = useRef<number | undefined>(activeFlight?.id);
+  const lastFlightIdContourRef = useRef<number | undefined>(activeFlight?.id);
 
   // Reset local overrides and errors when switching to another quarry
   useEffect(() => {
     setSelected3DKey('');
     setSelectedOrthoKey('');
+    setSelectedContourDxfKey('');
     setLocal3DPreview(null);
     setLocalOrthoFile(null);
+    setLocalContourDxfFile(null);
     setLoadedOrthophoto(null);
+    setLoadedContourDxf(null);
     setLoaded3DCadTransform(null);
     setOrthoLoading(false);
     setOrthoError(null);
+    setContourDxfLoading(false);
+    setContourDxfProgress(null);
+    setContourDxfError(null);
     setLocalHintError(null);
     setLocalSuccessNotice(null);
     lastFlightId3DRef.current = activeFlight?.id;
     lastFlightIdOrthoRef.current = activeFlight?.id;
+    lastFlightIdContourRef.current = activeFlight?.id;
   }, [quarry?.id]);
 
   // Clear stale 3D coordinate bounds whenever the selected 3D source changes
@@ -154,7 +187,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     setLoaded3DCadTransform(null);
   }, [selected3DKey]);
 
-  // Auto-select newly uploaded 3D or Orthophoto deliverable when uploaded from this workspace
+  // Auto-select newly uploaded 3D, Orthophoto, or Contour DXF deliverable when uploaded from this workspace
   useEffect(() => {
     if (!preferredDeliverableId) return;
     const d3 = compatible3DDeliverables.find((d) => d.id === preferredDeliverableId);
@@ -165,8 +198,14 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     const dO = compatibleOrthoDeliverables.find((d) => d.id === preferredDeliverableId);
     if (dO) {
       setSelectedOrthoKey(`deliv:${dO.id}`);
+      return;
     }
-  }, [preferredDeliverableId, compatible3DDeliverables, compatibleOrthoDeliverables]);
+    const dC = compatibleContourDxfDeliverables.find((d) => d.id === preferredDeliverableId);
+    if (dC) {
+      setSelectedContourDxfKey(`deliv:${dC.id}`);
+      setShowDxfContours(true);
+    }
+  }, [preferredDeliverableId, compatible3DDeliverables, compatibleOrthoDeliverables, compatibleContourDxfDeliverables]);
 
   // Automatically load the client's uploaded 3D model deliverable (prioritizing active flight)
   useEffect(() => {
@@ -216,6 +255,34 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     }
   }, [compatibleOrthoDeliverables, activeFlight?.id, selectedOrthoKey, isAdmin, localOrthoFile]);
 
+  // Automatically load the client's uploaded Contour DXF deliverable for BOTH 3D & 2D viewers
+  useEffect(() => {
+    const flightChanged = lastFlightIdContourRef.current !== activeFlight?.id;
+    lastFlightIdContourRef.current = activeFlight?.id;
+
+    if (selectedContourDxfKey === 'local' && isAdmin && localContourDxfFile && !flightChanged) {
+      return;
+    }
+
+    if (compatibleContourDxfDeliverables.length === 0) {
+      if (!(selectedContourDxfKey === 'local' && isAdmin && localContourDxfFile)) {
+        setSelectedContourDxfKey('');
+      }
+      return;
+    }
+
+    const currentId = selectedContourDxfKey.startsWith('deliv:')
+      ? Number(selectedContourDxfKey.slice(6))
+      : NaN;
+    const currentExists =
+      Number.isFinite(currentId) && compatibleContourDxfDeliverables.some((d) => d.id === currentId);
+
+    if (!currentExists || flightChanged) {
+      setSelectedContourDxfKey(`deliv:${compatibleContourDxfDeliverables[0].id}`);
+      setShowDxfContours(true);
+    }
+  }, [compatibleContourDxfDeliverables, activeFlight?.id, selectedContourDxfKey, isAdmin, localContourDxfFile]);
+
   // Revoke object URLs on change/unmount
   useEffect(() => {
     return () => {
@@ -232,6 +299,14 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
       }
     };
   }, [localOrthoFile]);
+
+  useEffect(() => {
+    return () => {
+      if (localContourDxfFile?.url.startsWith('blob:')) {
+        URL.revokeObjectURL(localContourDxfFile.url);
+      }
+    };
+  }, [localContourDxfFile]);
 
   const activeExternal3DSource = useMemo<External3DSource | null>(() => {
     if (selected3DKey === 'local' && isAdmin && local3DPreview) {
@@ -273,6 +348,28 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     return null;
   }, [selectedOrthoKey, isAdmin, localOrthoFile, compatibleOrthoDeliverables]);
 
+  const activeContourDxfTarget = useMemo<{ url: string; fileName: string; label: string } | null>(() => {
+    if (selectedContourDxfKey === 'local' && isAdmin && localContourDxfFile) {
+      return {
+        url: localContourDxfFile.url,
+        fileName: localContourDxfFile.fileName,
+        label: `Local: ${localContourDxfFile.fileName}`,
+      };
+    }
+    if (selectedContourDxfKey.startsWith('deliv:')) {
+      const id = Number(selectedContourDxfKey.slice(6));
+      const d = compatibleContourDxfDeliverables.find((item) => item.id === id);
+      if (d) {
+        return {
+          url: buildDeliverableAssetUrl(d),
+          fileName: d.fileName,
+          label: d.title || d.fileName,
+        };
+      }
+    }
+    return null;
+  }, [selectedContourDxfKey, isAdmin, localContourDxfFile, compatibleContourDxfDeliverables]);
+
   // Load selected Orthophoto canvas & GeoTIFF bounds automatically when target changes
   useEffect(() => {
     let cancelled = false;
@@ -312,12 +409,65 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     };
   }, [activeOrthoTarget, orthoReloadTick]);
 
+  // Load & parse uploaded Contour DXF automatically for BOTH 3D and 2D viewers
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!activeContourDxfTarget) {
+      setLoadedContourDxf(null);
+      setContourDxfLoading(false);
+      setContourDxfProgress(null);
+      setContourDxfError(null);
+      return;
+    }
+
+    setContourDxfLoading(true);
+    setContourDxfProgress({
+      percent: 4,
+      loadedBytes: 0,
+      totalBytes: null,
+      stage: 'downloading',
+      stageLabel: 'Conectando para descargar curvado DXF...',
+    });
+    setContourDxfError(null);
+
+    loadDxfContoursFromUrl(activeContourDxfTarget.url, activeContourDxfTarget.fileName, (info) => {
+      if (!cancelled) {
+        setContourDxfProgress(info);
+      }
+    })
+      .then((parsed) => {
+        if (!cancelled) {
+          setLoadedContourDxf(parsed);
+          setContourDxfLoading(false);
+          setContourDxfProgress(null);
+          setContourDxfError(null);
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          const message =
+            err instanceof Error ? err.message : 'No se pudo procesar el DXF de curvado.';
+          setLoadedContourDxf(null);
+          setContourDxfLoading(false);
+          setContourDxfProgress(null);
+          setContourDxfError(message);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeContourDxfTarget]);
+
   useEffect(() => {
     if (isAdmin) return;
     setLocal3DPreview(null);
     setLocalOrthoFile(null);
+    setLocalContourDxfFile(null);
     setSelected3DKey((k) => (k === 'local' ? '' : k));
     setSelectedOrthoKey((k) => (k === 'local' ? '' : k));
+    setSelectedContourDxfKey((k) => (k === 'local' ? '' : k));
   }, [isAdmin]);
 
   const handleLocalPreviewFile = (file: File | null) => {
@@ -329,6 +479,17 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     if (lower.endsWith('.laz')) {
       setLocalHintError(
         'Los archivos comprimidos .LAZ deben convertirse primero a .LAS, .PLY, .XYZ, .OBJ o .GLB para cargarse directamente en el visor web.'
+      );
+      return;
+    }
+
+    if (isSupportedContourDxfFileName(file.name)) {
+      const url = URL.createObjectURL(file);
+      setLocalContourDxfFile({ url, fileName: file.name });
+      setSelectedContourDxfKey('local');
+      setShowDxfContours(true);
+      setLocalSuccessNotice(
+        `Curvado DXF cargado en ambos visores (3D y 2D): ${file.name}`
       );
       return;
     }
@@ -356,7 +517,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     }
 
     setLocalHintError(
-      'Formato no compatible para vista 3D/Ortofoto. Usa .OBJ, .GLB, .GLTF, .PLY, .STL, .LAS, .XYZ, .PCD, .CSV/.TXT o ortofotos .PNG/.JPG/.TIF.'
+      'Formato no compatible para vista 3D/Ortofoto/Curvado. Usa .OBJ, .GLB, .GLTF, .PLY, .STL, .LAS, .XYZ, .PCD, .CSV/.TXT, ortofotos .PNG/.JPG/.TIF o curvado .DXF.'
     );
   };
 
@@ -395,14 +556,17 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
         source: 'dxf',
       };
     }
+    if (loadedContourDxf?.planBounds) {
+      return loadedContourDxf.planBounds;
+    }
     if (loaded3DCadTransform) {
       return cadTransformToPlanBounds(loaded3DCadTransform);
     }
     return null;
-  }, [loadedOrthophoto, dxfOverlay, loaded3DCadTransform]);
+  }, [loadedOrthophoto, dxfOverlay, loadedContourDxf, loaded3DCadTransform]);
 
-  const hasAny3DSource = Boolean(activeExternal3DSource);
-  const hasAnyOrthoSource = Boolean(activeOrthoTarget);
+  const hasAny3DSource = Boolean(activeExternal3DSource || activeContourDxfTarget);
+  const hasAnyOrthoSource = Boolean(activeOrthoTarget || activeContourDxfTarget);
 
   return (
     <section className="flex-1 flex flex-col gap-4 min-h-0">
@@ -510,6 +674,47 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
                 </select>
               </label>
 
+              <label className="inline-flex items-center gap-1.5 text-gray-300">
+                <Waves className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span className="font-semibold">Curvado DXF:</span>
+                <select
+                  value={selectedContourDxfKey}
+                  onChange={(e) => setSelectedContourDxfKey(e.target.value)}
+                  disabled={compatibleContourDxfDeliverables.length === 0 && !localContourDxfFile}
+                  className="bg-[#0b0f17] border border-gray-700 rounded-lg px-2.5 py-1 text-xs text-white cursor-pointer max-w-[220px] disabled:opacity-60 disabled:cursor-not-allowed"
+                  title="Un único DXF de curvado se proyecta automáticamente en el visor 3D y 2D"
+                >
+                  {compatibleContourDxfDeliverables.length === 0 && !localContourDxfFile ? (
+                    <option value="">Sin DXF de curvado</option>
+                  ) : (
+                    <>
+                      {compatibleContourDxfDeliverables.map((d) => (
+                        <option key={d.id} value={`deliv:${d.id}`}>
+                          {d.title || d.fileName} ({d.fileName})
+                        </option>
+                      ))}
+                      {localContourDxfFile && (
+                        <option value="local">Local: {localContourDxfFile.fileName}</option>
+                      )}
+                    </>
+                  )}
+                </select>
+                {(compatibleContourDxfDeliverables.length > 0 || localContourDxfFile) && (
+                  <button
+                    type="button"
+                    onClick={() => setShowDxfContours((v) => !v)}
+                    className={`px-2 py-1 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 border transition cursor-pointer ${
+                      showDxfContours
+                        ? 'bg-amber-500/20 text-amber-200 border-amber-500/45'
+                        : 'bg-[#0b0f17] text-gray-400 border-gray-700 hover:text-white'
+                    }`}
+                    title="Mostrar u ocultar curvas DXF sobre los visores 3D y 2D"
+                  >
+                    {showDxfContours ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+                  </button>
+                )}
+              </label>
+
               {dxfOverlay ? (
                 <button
                   type="button"
@@ -536,7 +741,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
                     type="button"
                     onClick={onOpenDxfSettings}
                     className="px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 border border-dashed border-cyan-500/40 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-200 transition cursor-pointer"
-                    title="Ir a Configuración → Perímetros DXF 3D para subir el DXF de este vuelo"
+                    title="Ir a Configuración → Perímetros DXF 3D para subir el DXF de acopios de este vuelo"
                   >
                     <FileCode2 className="w-3.5 h-3.5 text-cyan-400" />
                     <span>Asignar DXF 3D del vuelo</span>
@@ -548,13 +753,13 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
             <div className="flex flex-wrap items-center gap-2">
               <label
                 className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 font-semibold inline-flex items-center gap-1.5 cursor-pointer transition"
-                title="Cargar temporalmente desde tu equipo (.OBJ, .GLB, .PLY, .STL, .LAS, .XYZ, .PCD, .PNG, .JPG, .TIF)"
+                title="Cargar temporalmente desde tu equipo (.OBJ, .GLB, .PLY, .STL, .LAS, .XYZ, .PCD, .PNG, .JPG, .TIF, .DXF)"
               >
                 <FolderUp className="w-3.5 h-3.5 text-cyan-400" />
                 <span>Abrir Archivo Local</span>
                 <input
                   type="file"
-                  accept=".glb,.gltf,.obj,.ply,.stl,.las,.laz,.xyz,.pcd,.csv,.txt,.pts,.png,.jpg,.jpeg,.webp,.tif,.tiff"
+                  accept=".glb,.gltf,.obj,.ply,.stl,.las,.laz,.xyz,.pcd,.csv,.txt,.pts,.png,.jpg,.jpeg,.webp,.tif,.tiff,.dxf"
                   className="hidden"
                   onChange={(e) => {
                     const f = e.target.files?.[0] || null;
@@ -569,10 +774,10 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
                   type="button"
                   onClick={onOpenUploadModal}
                   className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold inline-flex items-center gap-1.5 shadow cursor-pointer transition"
-                  title="Subir archivo 3D u ortofoto al servidor del cliente (storage/<Cliente>/<Vuelo>/)"
+                  title="Subir archivo 3D, ortofoto o DXF de curvado al servidor del cliente (storage/<Cliente>/<Vuelo>/)"
                 >
                   <Upload className="w-3.5 h-3.5" />
-                  <span>Subir Modelo 3D / Ortofoto al Cliente</span>
+                  <span>Subir Modelo / DXF al Cliente</span>
                 </button>
               )}
             </div>
@@ -619,6 +824,13 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
             onToggleDxfOverlay={() => setShowDxfOverlay((v) => !v)}
             dxfOpacity={dxfOpacity}
             onChangeDxfOpacity={setDxfOpacity}
+            contourDxf={loadedContourDxf}
+            contourDxfLoading={contourDxfLoading}
+            contourDxfProgress={contourDxfProgress}
+            contourDxfFileName={activeContourDxfTarget?.fileName ?? null}
+            showDxfContours={showDxfContours}
+            onToggleDxfContours={() => setShowDxfContours((v) => !v)}
+            contourDxfError={contourDxfError}
           />
         ) : (
           <div className="glass-panel border border-gray-800 rounded-2xl flex-1 min-h-[540px] flex items-center justify-center p-6 bg-[#090d16]">
@@ -632,7 +844,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
                 </h3>
                 <p className="text-xs sm:text-sm text-gray-300 leading-relaxed">
                   {isAdmin
-                    ? 'No hay ningún modelo 3D subido para este cliente o vuelo. Sube un archivo (.OBJ, .GLB, .PLY, .STL, .LAS, .XYZ, .PCD) para que el cliente pueda visualizarlo.'
+                    ? 'No hay ningún modelo 3D ni DXF de curvado subido para este cliente o vuelo. Sube un archivo (.OBJ, .GLB, .PLY, .STL, .LAS, .XYZ, .PCD o .DXF) para que el cliente pueda visualizarlo.'
                     : 'No hay ningún archivo de modelo 3D disponible para visualizar en este momento. Por favor, ponte en contacto con el administrador para que suba los archivos del modelo.'}
                 </p>
               </div>
@@ -654,7 +866,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
                     className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 shadow cursor-pointer transition"
                   >
                     <Upload className="w-3.5 h-3.5" />
-                    <span>Subir Modelo 3D al Cliente</span>
+                    <span>Subir Modelo 3D / DXF al Cliente</span>
                   </button>
                 )}
               </div>
@@ -673,7 +885,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
               </h3>
               <p className="text-xs sm:text-sm text-gray-300 leading-relaxed">
                 {isAdmin
-                  ? 'No hay ninguna ortofoto o plano 2D subido para este cliente o vuelo. Sube una imagen (.TIF, .PNG, .JPG, .WEBP) para que el cliente pueda visualizarla.'
+                  ? 'No hay ninguna ortofoto, plano 2D ni DXF de curvado subido para este cliente o vuelo. Sube una imagen (.TIF, .PNG, .JPG, .WEBP) o un .DXF para que el cliente pueda visualizarlo.'
                   : 'No hay ningún archivo de ortofoto o plano 2D disponible para visualizar en este momento. Por favor, ponte en contacto con el administrador para que suba los archivos del vuelo.'}
               </p>
             </div>
@@ -695,13 +907,13 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
                   className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 shadow cursor-pointer transition"
                 >
                   <Upload className="w-3.5 h-3.5" />
-                  <span>Subir Ortofoto al Cliente</span>
+                  <span>Subir Ortofoto / DXF al Cliente</span>
                 </button>
               )}
             </div>
           </div>
         </div>
-      ) : orthoLoading ? (
+      ) : activeOrthoTarget && orthoLoading ? (
         <div className="glass-panel border border-gray-800 rounded-2xl flex-1 min-h-[540px] flex items-center justify-center p-6 bg-[#090d16]">
           <div className="text-center space-y-3 p-6 rounded-2xl border border-cyan-500/35 bg-[#0f1623] max-w-sm shadow-xl">
             <Loader2 className="w-8 h-8 text-cyan-400 animate-spin mx-auto" />
@@ -709,7 +921,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
             <p className="text-xs text-gray-400 break-all">{activeOrthoTarget?.fileName}</p>
           </div>
         </div>
-      ) : orthoError || !loadedOrthophoto ? (
+      ) : activeOrthoTarget && (orthoError || !loadedOrthophoto) ? (
         <div className="glass-panel border border-gray-800 rounded-2xl flex-1 min-h-[540px] flex items-center justify-center p-6 bg-[#090d16]">
           <div className="max-w-md w-full text-center space-y-4 bg-[#0f1623] border border-red-500/40 rounded-2xl p-6 shadow-xl">
             <div className="w-12 h-12 mx-auto rounded-xl bg-red-500/15 border border-red-500/30 text-red-300 flex items-center justify-center">
@@ -731,17 +943,29 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
             </button>
           </div>
         </div>
+      ) : !activeOrthoTarget && contourDxfLoading ? (
+        <div className="glass-panel border border-gray-800 rounded-2xl flex-1 min-h-[540px] flex items-center justify-center p-6 bg-[#090d16]">
+          <div className="text-center space-y-3 p-6 rounded-2xl border border-amber-500/35 bg-[#0f1623] max-w-sm shadow-xl">
+            <Loader2 className="w-8 h-8 text-amber-400 animate-spin mx-auto" />
+            <p className="text-sm font-bold text-amber-300">Cargando curvado DXF del cliente...</p>
+            <p className="text-xs text-gray-400 break-all">{activeContourDxfTarget?.fileName}</p>
+          </div>
+        </div>
       ) : (
         <Quarry2DOrthophotoViewer
           key={quarry?.id ?? 'single-quarry'}
           quarry={quarry}
           activeFlight={activeFlight}
           terrain={terrain}
-          customOrthoCanvas={loadedOrthophoto.canvas}
-          orthoNaturalSize={{
-            width: loadedOrthophoto.naturalWidth,
-            height: loadedOrthophoto.naturalHeight,
-          }}
+          customOrthoCanvas={loadedOrthophoto?.canvas ?? null}
+          orthoNaturalSize={
+            loadedOrthophoto
+              ? {
+                  width: loadedOrthophoto.naturalWidth,
+                  height: loadedOrthophoto.naturalHeight,
+                }
+              : null
+          }
           planBounds={resolved2DPlanBounds}
           dxfOverlay={dxfOverlay}
           dxfStockpiles={scopedStockpiles}
@@ -749,6 +973,10 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
           onToggleDxfOverlay={() => setShowDxfOverlay((v) => !v)}
           dxfOpacity={dxfOpacity}
           onChangeDxfOpacity={setDxfOpacity}
+          contourDxf={loadedContourDxf}
+          showDxfContours={showDxfContours}
+          onToggleDxfContours={() => setShowDxfContours((v) => !v)}
+          contourDxfError={contourDxfError}
         />
       )}
     </section>

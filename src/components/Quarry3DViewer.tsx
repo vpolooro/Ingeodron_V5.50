@@ -14,6 +14,7 @@ import {
   EyeOff,
   FileSpreadsheet,
   Layers,
+  Loader2,
   MapPin,
   Maximize2,
   MessageSquarePlus,
@@ -51,6 +52,7 @@ import {
   load3DAssetFromUrl,
   scenePointToCadCoords,
   type CadTransform,
+  type Load3DProgressInfo,
   type Loaded3DAssetResult,
 } from '../utils/threeFileLoader.ts';
 import {
@@ -69,6 +71,11 @@ import {
 } from '../utils/drawing3DOverlay.ts';
 import { exportProfile2DDxf, exportProfile3DDxf } from '../utils/dxfProfileExporter.ts';
 import { buildDxfOverlay3DGroup } from '../utils/dxfThreeBuilder.ts';
+import {
+  buildDxfContours3DGroup,
+  type DxfContourProgressInfo,
+  type ParsedDxfContours,
+} from '../utils/dxfContourParser.ts';
 import type { FlightDxfOverlay, Quarry, Stockpile, Survey } from '../types.ts';
 import { formatEsInt, formatEsNumber } from '../utils/numberFormat.ts';
 
@@ -96,6 +103,13 @@ interface Quarry3DViewerProps {
   onToggleDxfOverlay?: () => void;
   dxfOpacity?: number;
   onChangeDxfOpacity?: (v: number) => void;
+  contourDxf?: ParsedDxfContours | null;
+  contourDxfLoading?: boolean;
+  contourDxfProgress?: DxfContourProgressInfo | null;
+  contourDxfFileName?: string | null;
+  showDxfContours?: boolean;
+  onToggleDxfContours?: () => void;
+  contourDxfError?: string | null;
 }
 
 interface CameraGoal {
@@ -107,6 +121,14 @@ interface CameraGoal {
 function formatElevM(v: number): string {
   if (!Number.isFinite(v)) return '0';
   return Math.abs(v - Math.round(v)) < 0.05 ? formatEsInt(v) : formatEsNumber(v, 1);
+}
+
+function formatBytesLabel(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 KB';
+  if (bytes < 1024 * 1024) {
+    return `${formatEsNumber(Math.max(1, bytes / 1024), 0)} KB`;
+  }
+  return `${formatEsNumber(bytes / (1024 * 1024), 1)} MB`;
 }
 
 function computeDemVisualSpan(zMinM: number, zMaxM: number): number {
@@ -179,6 +201,13 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   onToggleDxfOverlay,
   dxfOpacity: controlledDxfOpacity,
   onChangeDxfOpacity,
+  contourDxf = null,
+  contourDxfLoading = false,
+  contourDxfProgress = null,
+  contourDxfFileName = null,
+  showDxfContours: controlledShowDxfContours,
+  onToggleDxfContours,
+  contourDxfError = null,
 }) => {
   const viewerWrapperRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -199,15 +228,22 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   const [showProfileIn3D, setShowProfileIn3D] = useState<boolean>(false);
 
   const [internalShowDxfOverlay, setInternalShowDxfOverlay] = useState<boolean>(true);
+  const [internalShowDxfContours, setInternalShowDxfContours] = useState<boolean>(true);
   const [internalDxfOpacity, setInternalDxfOpacity] = useState<number>(0.48);
   const [selectedDxfPolyId, setSelectedDxfPolyId] = useState<string | null>(null);
   const showDxfOverlay =
     controlledShowDxfOverlay !== undefined ? controlledShowDxfOverlay : internalShowDxfOverlay;
+  const showDxfContours =
+    controlledShowDxfContours !== undefined ? controlledShowDxfContours : internalShowDxfContours;
   const dxfOpacity =
     controlledDxfOpacity !== undefined ? controlledDxfOpacity : internalDxfOpacity;
   const toggleDxfOverlay = () => {
     if (onToggleDxfOverlay) onToggleDxfOverlay();
     else setInternalShowDxfOverlay((v) => !v);
+  };
+  const toggleDxfContours = () => {
+    if (onToggleDxfContours) onToggleDxfContours();
+    else setInternalShowDxfContours((v) => !v);
   };
   const changeDxfOpacity = (v: number) => {
     if (onChangeDxfOpacity) onChangeDxfOpacity(v);
@@ -266,6 +302,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   const [externalHeightSpan, setExternalHeightSpan] = useState<number>(55);
 
   const [externalLoading, setExternalLoading] = useState<boolean>(false);
+  const [externalProgress, setExternalProgress] = useState<Load3DProgressInfo | null>(null);
   const [externalError, setExternalError] = useState<string | null>(null);
   const [externalInfo, setExternalInfo] = useState<{
     count: number;
@@ -305,6 +342,9 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   const dxfOverlayRef = useRef<FlightDxfOverlay | null>(dxfOverlay);
   const dxfStockpilesRef = useRef<Stockpile[]>(dxfStockpiles);
   const showDxfOverlayRef = useRef<boolean>(showDxfOverlay);
+  const contourDxfRef = useRef<ParsedDxfContours | null>(contourDxf);
+  const showDxfContoursRef = useRef<boolean>(showDxfContours);
+  const contourCadTransformRef = useRef<CadTransform | null>(null);
   const dxfOpacityRef = useRef<number>(dxfOpacity);
   const selectedDxfPolyIdRef = useRef<string | null>(selectedDxfPolyId);
   const dxfFocusTargetsRef = useRef<Map<string, { center: THREE.Vector3; span: number }>>(new Map());
@@ -320,6 +360,8 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   dxfOverlayRef.current = dxfOverlay;
   dxfStockpilesRef.current = dxfStockpiles;
   showDxfOverlayRef.current = showDxfOverlay;
+  contourDxfRef.current = contourDxf;
+  showDxfContoursRef.current = showDxfContours;
   dxfOpacityRef.current = dxfOpacity;
   selectedDxfPolyIdRef.current = selectedDxfPolyId;
   hasExternalRef.current = Boolean(external3DSource);
@@ -439,6 +481,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     profileRibbon: THREE.Mesh;
     drawOverlayGroup: THREE.Group;
     dxfOverlayGroup: THREE.Group;
+    dxfContourGroup: THREE.Group;
     refPlaneGroup: THREE.Group;
     externalHost: THREE.Group;
     externalAsset: Loaded3DAssetResult | null;
@@ -457,6 +500,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     ) => void;
     rebuildDrawOverlay: () => void;
     rebuildDxfOverlay: () => void;
+    rebuildDxfContourOverlay: () => void;
     isSoftwareGl: boolean;
   } | null>(null);
 
@@ -858,10 +902,26 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         const distH = radius / Math.sin(hFov / 2);
         fitDist = Math.max(distV, distH) * 0.92;
       }
+    } else if (contourDxfRef.current && ctx.dxfContourGroup.children.length > 0) {
+      ctx.dxfContourGroup.scale.y = exVal;
+      ctx.dxfContourGroup.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(ctx.dxfContourGroup);
+      if (!box.isEmpty()) {
+        const size = new THREE.Vector3();
+        box.getCenter(target);
+        box.getSize(size);
+        const radius = Math.max(24, size.length() * 0.5);
+        const vFov = THREE.MathUtils.degToRad(ctx.camera.fov);
+        const aspect = Math.max(0.5, ctx.camera.aspect || 1.4);
+        const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect);
+        const distV = radius / Math.sin(vFov / 2);
+        const distH = radius / Math.sin(hFov / 2);
+        fitDist = Math.max(distV, distH) * 0.92;
+      }
     } else {
       const visSpan = computeDemVisualSpan(zMinMRef.current, zMaxMRef.current);
       target.set(0, Math.min(80, visSpan * 0.32 * exVal), 0);
-      const radius = Math.max(120, Math.hypot(TERRAIN_SPAN_M, visSpan * exVal) * 0.5);
+      const radius = Math.max(120, Math.max(TERRAIN_SPAN_M, visSpan * exVal) * 0.55);
       const vFov = THREE.MathUtils.degToRad(ctx.camera.fov);
       const aspect = Math.max(0.5, ctx.camera.aspect || 1.4);
       const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect);
@@ -1270,6 +1330,10 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     const dxfOverlayGroup = new THREE.Group();
     scene.add(dxfOverlayGroup);
 
+    // 9c. Uploaded Contour DXF Lines Overlay (Curvas de Nivel DXF)
+    const dxfContourGroup = new THREE.Group();
+    scene.add(dxfContourGroup);
+
     // 10. Horizontal Reference Elevation / Flood / Bench-Floor Plane
     const refPlaneGroup = new THREE.Group();
     const refPlaneGeom = new THREE.PlaneGeometry(TERRAIN_SPAN_M * 1.06, TERRAIN_SPAN_M * 1.06);
@@ -1458,15 +1522,20 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
 
     const updateRenderVisibility = (mode: RenderMode3D) => {
       const extLoaded = Boolean(sceneRef.current?.externalAsset && hasExternalRef.current);
-      terrainMesh.visible = !extLoaded && mode !== 'nube';
-      skirtMesh.visible = !extLoaded && mode !== 'nube';
-      contourGroup.visible = !extLoaded && mode === 'curvas';
-      pointCloud.visible = !extLoaded && mode === 'nube';
-      tinWireMesh.visible = !extLoaded && mode === 'tin';
-      profileGroup.visible = !extLoaded && showProfileIn3DRef.current;
+      const contourLoaded = Boolean(contourDxfRef.current && dxfContourGroup.children.length > 0);
+      const hideSyntheticDem = extLoaded || contourLoaded;
+
+      terrainMesh.visible = !hideSyntheticDem && mode !== 'nube';
+      skirtMesh.visible = !hideSyntheticDem && mode !== 'nube';
+      contourGroup.visible = !hideSyntheticDem && mode === 'curvas';
+      pointCloud.visible = !hideSyntheticDem && mode === 'nube';
+      tinWireMesh.visible = !hideSyntheticDem && mode === 'tin';
+      profileGroup.visible = !hideSyntheticDem && showProfileIn3DRef.current;
       externalHost.visible = extLoaded;
       dxfOverlayGroup.visible =
         Boolean(dxfOverlayRef.current) && (mode === 'dxf' || showDxfOverlayRef.current);
+      dxfContourGroup.visible =
+        contourLoaded && (showDxfContoursRef.current || mode === 'curvas');
 
       if (extLoaded && sceneRef.current?.externalAsset) {
         sceneRef.current.externalAsset.setHypsometricMode(mode === 'hipsometria');
@@ -1655,6 +1724,41 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       dxfFocusTargetsRef.current = built.focusTargets;
       dxfOverlayGroup.visible =
         renderModeRef.current === 'dxf' || showDxfOverlayRef.current;
+    };
+
+    const rebuildDxfContourOverlay = () => {
+      while (dxfContourGroup.children.length > 0) {
+        const child = dxfContourGroup.children[0];
+        dxfContourGroup.remove(child);
+        disposeObject3DTree(child);
+      }
+      contourCadTransformRef.current = null;
+
+      const parsed = contourDxfRef.current;
+      if (!parsed) return;
+
+      const extAsset = hasExternalRef.current ? sceneRef.current?.externalAsset ?? null : null;
+      let extBox: THREE.Box3 | null = null;
+      if (extAsset) {
+        const prevScaleY = extAsset.group.scale.y;
+        extAsset.group.scale.y = 1;
+        extAsset.group.updateMatrixWorld(true);
+        extBox = new THREE.Box3().setFromObject(extAsset.group);
+        extAsset.group.scale.y = prevScaleY;
+        extAsset.group.updateMatrixWorld(true);
+      }
+
+      const built = buildDxfContours3DGroup(parsed, {
+        externalCadTransform: extAsset?.cadTransform ?? null,
+        externalAssetBox: extBox,
+      });
+
+      dxfContourGroup.add(built.group);
+      dxfContourGroup.scale.y = exaggerationRef.current;
+      dxfContourGroup.updateMatrixWorld(true);
+      contourCadTransformRef.current = built.cadTransform;
+      dxfContourGroup.visible =
+        showDxfContoursRef.current || renderModeRef.current === 'curvas';
     };
 
     const onPointerDown = (e: PointerEvent) => {
@@ -1967,6 +2071,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       profileRibbon,
       drawOverlayGroup,
       dxfOverlayGroup,
+      dxfContourGroup,
       refPlaneGroup,
       externalHost,
       externalAsset: null,
@@ -1981,11 +2086,14 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       updateProfileGeometry,
       rebuildDrawOverlay,
       rebuildDxfOverlay,
+      rebuildDxfContourOverlay,
       isSoftwareGl,
     };
 
     rebuildDrawOverlay();
     rebuildDxfOverlay();
+    rebuildDxfContourOverlay();
+    updateRenderVisibility(renderModeRef.current);
     requestRender();
 
     return () => {
@@ -2000,6 +2108,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       renderer.domElement.removeEventListener('webglcontextrestored', handleContextRestored);
       disposeObject3DTree(drawOverlayGroup);
       disposeObject3DTree(dxfOverlayGroup);
+      disposeObject3DTree(dxfContourGroup);
       disposeObject3DTree(refPlaneGroup);
       if (sceneRef.current?.externalAsset) {
         sceneRef.current.externalAsset.dispose();
@@ -2082,6 +2191,9 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     if (!ctx) return;
 
     let cancelled = false;
+    let raf1 = 0;
+    let raf2 = 0;
+    let settleTimer: number | null = null;
     const isNewSource = lastExternalSourceRef.current !== external3DSource;
     lastExternalSourceRef.current = external3DSource;
 
@@ -2095,29 +2207,55 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
 
     if (!external3DSource) {
       clearExistingExternal();
-      ctx.baseGrid.position.y = -14.2;
-      onModelBoundsChangeRef.current?.(null);
-      metersPerUnitRef.current = 1;
-      zMinMRef.current = demElevationBoundsRef.current.minM;
-      zMaxMRef.current = demElevationBoundsRef.current.maxM;
-      setZMinM(demElevationBoundsRef.current.minM);
-      setZMaxM(demElevationBoundsRef.current.maxM);
-      setRefPlaneElevM(
-        Math.round(
-          ((demElevationBoundsRef.current.minM + demElevationBoundsRef.current.maxM) * 0.5) * 10
-        ) / 10
-      );
+      ctx.rebuildDxfContourOverlay();
+      if (contourDxfRef.current && contourCadTransformRef.current) {
+        ctx.baseGrid.position.y = -0.5;
+        onModelBoundsChangeRef.current?.({ ...contourCadTransformRef.current });
+        metersPerUnitRef.current = 1 / Math.max(1e-9, contourCadTransformRef.current.scaleFactor);
+        const cMinZ = Math.round(contourDxfRef.current.bounds.minZ * 100) / 100;
+        const rawMaxZ = Math.round(contourDxfRef.current.bounds.maxZ * 100) / 100;
+        const cMaxZ = rawMaxZ > cMinZ ? rawMaxZ : cMinZ + 1;
+        zMinMRef.current = cMinZ;
+        zMaxMRef.current = cMaxZ;
+        setZMinM(cMinZ);
+        setZMaxM(cMaxZ);
+        setRefPlaneElevM(Math.round(((cMinZ + cMaxZ) * 0.5) * 10) / 10);
+      } else {
+        ctx.baseGrid.position.y = -14.2;
+        onModelBoundsChangeRef.current?.(null);
+        metersPerUnitRef.current = 1;
+        zMinMRef.current = demElevationBoundsRef.current.minM;
+        zMaxMRef.current = demElevationBoundsRef.current.maxM;
+        setZMinM(demElevationBoundsRef.current.minM);
+        setZMaxM(demElevationBoundsRef.current.maxM);
+        setRefPlaneElevM(
+          Math.round(
+            ((demElevationBoundsRef.current.minM + demElevationBoundsRef.current.maxM) * 0.5) * 10
+          ) / 10
+        );
+      }
       setExternalLoading(false);
+      setExternalProgress(null);
       setExternalError(null);
       setExternalInfo(null);
       ctx.updateRenderVisibility(renderModeRef.current);
       ctx.rebuildDrawOverlay();
       ctx.rebuildDxfOverlay();
+      if (contourDxfRef.current) {
+        computeModelFramingGoal('oblique', exaggerationRef.current, true);
+      }
       ctx.requestRender();
       return;
     }
 
     setExternalLoading(true);
+    setExternalProgress({
+      percent: 2,
+      loadedBytes: 0,
+      totalBytes: null,
+      stage: 'downloading',
+      stageLabel: 'Conectando con el servidor...',
+    });
     setExternalError(null);
     clearExistingExternal();
 
@@ -2127,10 +2265,19 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       setExternalZUp(defaultZ);
     }
 
+    let latestBytes = 0;
+    let latestTotalBytes: number | null = null;
+
     load3DAssetFromUrl(external3DSource.url, external3DSource.fileName, ctx.isSoftwareGl, {
       maxPoints: pointMaxCount,
       pointSize: pointSizeRef.current,
       maxAnisotropy: ctx.maxAniso,
+      onProgress: (info) => {
+        if (cancelled) return;
+        latestBytes = info.loadedBytes;
+        latestTotalBytes = info.totalBytes;
+        setExternalProgress(info);
+      },
     })
       .then((asset) => {
         if (cancelled || !sceneRef.current) {
@@ -2154,7 +2301,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
           totalCount: asset.totalSourcePoints,
           kind: asset.kind,
         });
-        setExternalLoading(false);
+        ctx.rebuildDxfContourOverlay();
         ctx.updateRenderVisibility(renderModeRef.current);
         ctx.rebuildDrawOverlay();
         ctx.rebuildDxfOverlay();
@@ -2163,13 +2310,45 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         if (isNewSource) {
           setActivePreset('oblique');
           computeModelFramingGoal('oblique', exaggerationRef.current, true);
-        } else {
-          ctx.requestRender();
         }
+
+        setExternalProgress({
+          percent: 98,
+          loadedBytes: latestBytes,
+          totalBytes: latestTotalBytes,
+          stage: 'finalizing',
+          stageLabel: 'Renderizando primer fotograma WebGL...',
+        });
+        if (!ctx.isSoftwareGl) {
+          ctx.renderer.compile(ctx.scene, ctx.camera);
+        }
+        ctx.requestRender();
+
+        raf1 = requestAnimationFrame(() => {
+          if (cancelled) return;
+          ctx.requestRender();
+          raf2 = requestAnimationFrame(() => {
+            if (cancelled) return;
+            setExternalProgress({
+              percent: 100,
+              loadedBytes: latestBytes,
+              totalBytes: latestTotalBytes,
+              stage: 'finalizing',
+              stageLabel: 'Modelo 3D cargado',
+            });
+            settleTimer = window.setTimeout(() => {
+              if (!cancelled) {
+                setExternalLoading(false);
+                setExternalProgress(null);
+              }
+            }, 140);
+          });
+        });
       })
       .catch((err: unknown) => {
         if (cancelled) return;
         setExternalLoading(false);
+        setExternalProgress(null);
         setExternalInfo(null);
         setExternalError(err instanceof Error ? err.message : 'No se pudo cargar el archivo 3D.');
         ctx.updateRenderVisibility(renderModeRef.current);
@@ -2178,6 +2357,9 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
 
     return () => {
       cancelled = true;
+      if (raf1) cancelAnimationFrame(raf1);
+      if (raf2) cancelAnimationFrame(raf2);
+      if (settleTimer !== null) window.clearTimeout(settleTimer);
     };
   }, [external3DSource, pointMaxCount]);
 
@@ -2220,13 +2402,13 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     ctx.requestRender();
   }, [customOrthoCanvas]);
 
-  // React to renderMode, 3D profile & DXF overlay visibility change
+  // React to renderMode, 3D profile & DXF overlay/contour visibility change
   useEffect(() => {
     const ctx = sceneRef.current;
     if (!ctx) return;
     ctx.updateRenderVisibility(renderMode);
     ctx.requestRender();
-  }, [renderMode, showProfileIn3D, showDxfOverlay, dxfOverlay]);
+  }, [renderMode, showProfileIn3D, showDxfOverlay, dxfOverlay, showDxfContours, contourDxf]);
 
   // React to exaggeration and Z range change
   useEffect(() => {
@@ -2236,11 +2418,41 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     if (ctx.externalAsset) {
       ctx.externalAsset.group.scale.y = exaggeration;
     }
+    ctx.dxfContourGroup.scale.y = exaggeration;
     ctx.updateProfileGeometry(activeProfileSegment.p0, activeProfileSegment.p1, exaggeration);
     ctx.rebuildDrawOverlay();
     ctx.rebuildDxfOverlay();
     ctx.requestRender();
   }, [exaggeration, activeProfileSegment, zMinM, zMaxM]);
+
+  // Rebuild uploaded Contour DXF 3D geometry whenever contourDxf changes
+  useEffect(() => {
+    const ctx = sceneRef.current;
+    if (!ctx) return;
+    ctx.rebuildDxfContourOverlay();
+    if (!external3DSource) {
+      if (contourDxf && contourCadTransformRef.current) {
+        ctx.baseGrid.position.y = -0.5;
+        onModelBoundsChangeRef.current?.({ ...contourCadTransformRef.current });
+        metersPerUnitRef.current = 1 / Math.max(1e-9, contourCadTransformRef.current.scaleFactor);
+        const cMinZ = Math.round(contourDxf.bounds.minZ * 100) / 100;
+        const rawMaxZ = Math.round(contourDxf.bounds.maxZ * 100) / 100;
+        const cMaxZ = rawMaxZ > cMinZ ? rawMaxZ : cMinZ + 1;
+        zMinMRef.current = cMinZ;
+        zMaxMRef.current = cMaxZ;
+        setZMinM(cMinZ);
+        setZMaxM(cMaxZ);
+        setRefPlaneElevM(Math.round(((cMinZ + cMaxZ) * 0.5) * 10) / 10);
+        setActivePreset('oblique');
+        computeModelFramingGoal('oblique', exaggerationRef.current, true);
+      } else {
+        ctx.baseGrid.position.y = -14.2;
+        onModelBoundsChangeRef.current?.(null);
+      }
+    }
+    ctx.updateRenderVisibility(renderModeRef.current);
+    ctx.requestRender();
+  }, [contourDxf, external3DSource]);
 
   // Rebuild DXF 3D overlay whenever flight DXF, stockpiles, opacity, or selection changes
   useEffect(() => {
@@ -2404,6 +2616,64 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       ? profileSamples[hoverSampleIdx]
       : null;
 
+  const loadingOverlayState = useMemo(() => {
+    const active3D = externalLoading;
+    const activeDxf = Boolean(contourDxfLoading);
+    if (!active3D && !activeDxf) return null;
+
+    if (active3D && activeDxf) {
+      const p3d = externalProgress?.percent ?? null;
+      const pdxf = contourDxfProgress?.percent ?? null;
+      const combinedPercent =
+        p3d === null && pdxf === null
+          ? null
+          : Math.min(99, Math.round(((p3d ?? 15) * 0.8) + ((pdxf ?? 15) * 0.2)));
+
+      const loadedBytes =
+        (externalProgress?.loadedBytes ?? 0) + (contourDxfProgress?.loadedBytes ?? 0);
+      const totalBytes =
+        externalProgress?.totalBytes && contourDxfProgress?.totalBytes
+          ? externalProgress.totalBytes + contourDxfProgress.totalBytes
+          : externalProgress?.totalBytes ?? contourDxfProgress?.totalBytes ?? null;
+
+      return {
+        title: 'Cargando modelo 3D y curvado DXF...',
+        fileName: `${external3DSource?.fileName ?? 'Modelo 3D'} + ${contourDxfFileName ?? 'Curvado.dxf'}`,
+        stageLabel: `${externalProgress?.stageLabel ?? 'Cargando modelo 3D...'} · ${contourDxfProgress?.stageLabel ?? 'Cargando curvado DXF...'}`,
+        percent: combinedPercent,
+        loadedBytes,
+        totalBytes,
+      };
+    }
+
+    if (active3D) {
+      return {
+        title: 'Cargando modelo 3D...',
+        fileName: external3DSource?.fileName ?? '',
+        stageLabel: externalProgress?.stageLabel ?? 'Preparando geometría / nube de puntos...',
+        percent: externalProgress?.percent ?? null,
+        loadedBytes: externalProgress?.loadedBytes ?? 0,
+        totalBytes: externalProgress?.totalBytes ?? null,
+      };
+    }
+
+    return {
+      title: 'Cargando curvado DXF...',
+      fileName: contourDxfFileName ?? 'Curvado.dxf',
+      stageLabel: contourDxfProgress?.stageLabel ?? 'Descargando curvas de nivel DXF...',
+      percent: contourDxfProgress?.percent ?? null,
+      loadedBytes: contourDxfProgress?.loadedBytes ?? 0,
+      totalBytes: contourDxfProgress?.totalBytes ?? null,
+    };
+  }, [
+    externalLoading,
+    externalProgress,
+    external3DSource?.fileName,
+    contourDxfLoading,
+    contourDxfProgress,
+    contourDxfFileName,
+  ]);
+
   return (
     <div
       ref={viewerWrapperRef}
@@ -2439,13 +2709,46 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         </div>
       )}
 
-      {externalLoading && (
-        <div className="absolute inset-0 bg-[#090d16]/85 flex items-center justify-center z-40">
-          <div className="text-center space-y-2 p-6 rounded-xl border border-cyan-500/40 bg-[#111827] max-w-sm">
-            <p className="text-sm font-bold text-cyan-300">Procesando archivo 3D...</p>
-            <p className="text-xs text-gray-400">
-              Cargando y normalizando geometría / nube de puntos en WebGL ({external3DSource?.fileName})
-            </p>
+      {loadingOverlayState && (
+        <div className="absolute inset-0 bg-[#090d16]/88 backdrop-blur-sm flex items-center justify-center z-40 p-4">
+          <div className="w-full max-w-md space-y-3.5 p-6 rounded-2xl border border-cyan-500/40 bg-[#0f172a] shadow-2xl">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <Loader2 className="w-5 h-5 text-cyan-400 animate-spin shrink-0" />
+                <div className="min-w-0">
+                  <p className="text-sm font-bold text-cyan-200 truncate">{loadingOverlayState.title}</p>
+                  {loadingOverlayState.fileName && (
+                    <p className="text-[11px] font-mono text-gray-400 truncate" title={loadingOverlayState.fileName}>
+                      {loadingOverlayState.fileName}
+                    </p>
+                  )}
+                </div>
+              </div>
+              <span className="shrink-0 px-2 py-0.5 rounded-md bg-cyan-500/15 border border-cyan-500/35 text-xs font-mono font-bold text-cyan-300">
+                {loadingOverlayState.percent !== null ? `${loadingOverlayState.percent}%` : '...'}
+              </span>
+            </div>
+
+            <div className="w-full h-2.5 rounded-full bg-gray-800/95 border border-gray-700/70 overflow-hidden">
+              {loadingOverlayState.percent !== null ? (
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-emerald-400 transition-[width] duration-200 ease-out"
+                  style={{ width: `${Math.max(3, Math.min(100, loadingOverlayState.percent))}%` }}
+                />
+              ) : (
+                <div className="h-full w-full rounded-full bg-gradient-to-r from-cyan-500/30 via-cyan-400 to-emerald-400/40 animate-pulse" />
+              )}
+            </div>
+
+            <div className="flex items-center justify-between gap-3 text-[11px]">
+              <span className="text-gray-300 truncate">{loadingOverlayState.stageLabel}</span>
+              {loadingOverlayState.loadedBytes > 0 && (
+                <span className="font-mono text-gray-400 shrink-0">
+                  {formatBytesLabel(loadingOverlayState.loadedBytes)}
+                  {loadingOverlayState.totalBytes ? ` / ${formatBytesLabel(loadingOverlayState.totalBytes)}` : ''}
+                </span>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -2475,7 +2778,11 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
             <Mountain className="w-4 h-4 text-cyan-400 shrink-0" />
             <div className="min-w-0">
               <div className="text-xs font-bold text-white truncate">
-                {external3DSource ? external3DSource.label : quarry?.name || 'Modelo Digital de Elevaciones'}
+                {external3DSource
+                  ? external3DSource.label
+                  : contourDxf
+                  ? contourDxf.fileName
+                  : quarry?.name || 'Modelo Digital de Elevaciones'}
               </div>
               <div className="text-[10px] font-mono text-gray-400 truncate">
                 {external3DSource && externalInfo
@@ -2484,12 +2791,26 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
                         ? ` / ${formatEsInt(externalInfo.totalCount)}`
                         : ''
                     } pts`
+                  : contourDxf
+                  ? `Curvado DXF · ${formatEsInt(contourDxf.polylines.length)} curvas`
                   : activeFlight
                   ? `${activeFlight.flightCode} · ${formatDateEu(activeFlight.surveyDate)}`
                   : `MDE 400×400 m · ${formatElevM(zMinM)}–${formatElevM(zMaxM)} m`}
               </div>
             </div>
           </div>
+
+          {contourDxf && external3DSource && (
+            <div className="mt-1.5 text-[10px] font-mono text-amber-300/90 truncate" title={contourDxf.fileName}>
+              Curvado DXF: {contourDxf.fileName} ({formatEsInt(contourDxf.polylines.length)} curvas)
+            </div>
+          )}
+
+          {contourDxfError && (
+            <div className="mt-1.5 text-[10px] text-amber-300 bg-amber-500/10 border border-amber-500/35 rounded px-2 py-1">
+              {contourDxfError}
+            </div>
+          )}
 
           <div className="mt-2 pt-2 border-t border-gray-800/80 flex items-center justify-between gap-2 text-[10px]">
             <span className="text-gray-400 font-semibold whitespace-nowrap">Cota Z (auto):</span>
@@ -2518,6 +2839,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
                       onModelBoundsChangeRef.current?.({ ...ctx.externalAsset.cadTransform });
                       ctx.rebuildDrawOverlay();
                       ctx.rebuildDxfOverlay();
+                      ctx.rebuildDxfContourOverlay();
                       computeModelFramingGoal(activePreset, exaggeration);
                     }
                   }}
@@ -3690,6 +4012,26 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
               </div>
 
               <div className="flex flex-wrap items-center gap-2 shrink-0">
+                {contourDxf && (
+                  <button
+                    type="button"
+                    onClick={toggleDxfContours}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1.5 border transition cursor-pointer ${
+                      showDxfContours || renderMode === 'curvas'
+                        ? 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border-amber-500/45'
+                        : 'bg-[#111827] hover:bg-gray-800 text-gray-400 hover:text-white border-gray-700'
+                    }`}
+                    title={`Mostrar u ocultar curvas de nivel DXF (${contourDxf.fileName}) sobre el modelo 3D`}
+                  >
+                    {showDxfContours || renderMode === 'curvas' ? (
+                      <Eye className="w-3.5 h-3.5" />
+                    ) : (
+                      <EyeOff className="w-3.5 h-3.5" />
+                    )}
+                    <span>Curvado DXF ({formatEsInt(contourDxf.polylines.length)})</span>
+                  </button>
+                )}
+
                 {dxfOverlay && (
                   <>
                     {renderMode !== 'dxf' && (

@@ -5998,8 +5998,13 @@ export default function App() {
                       <option value="mesh_obj">Modelo / Malla 3D (OBJ, GLB, GLTF, STL)</option>
                       <option value="pointcloud_las">Nube de Puntos 3D (LAS, PLY, XYZ, PCD, CSV)</option>
                       <option value="orthophoto">Ortomosaico 2D/3D (GeoTIFF, PNG, JPG)</option>
-                      <option value="contour_dxf">Curvas de Nivel (DXF)</option>
+                      <option value="contour_dxf">Curvas de Nivel (DXF — Visores 3D y 2D)</option>
                     </select>
+                    {modalUploadData.category === 'contour_dxf' && (
+                      <p className="mt-1.5 text-[11px] text-amber-300/95 bg-amber-500/10 border border-amber-500/30 rounded-lg px-2.5 py-1.5">
+                        Con subir un único <span className="font-mono font-semibold">.DXF</span> aquí (en formato ASCII) se cargará automáticamente tanto sobre el modelo 3D como sobre la ortofoto 2D.
+                      </p>
+                    )}
                   </div>
 
                   <div>
