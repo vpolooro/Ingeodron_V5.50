@@ -49,6 +49,8 @@ import { formatDateEu } from '../utils/dateUtils.ts';
 import {
   createPointCircleSpriteTexture,
   load3DAssetFromUrl,
+  scenePointToCadCoords,
+  type CadTransform,
   type Loaded3DAssetResult,
 } from '../utils/threeFileLoader.ts';
 import {
@@ -87,6 +89,7 @@ interface Quarry3DViewerProps {
   external3DSource?: External3DSource | null;
   customOrthoCanvas?: HTMLCanvasElement | null;
   onClearExternal3D?: () => void;
+  onModelBoundsChange?: (cadTransform: CadTransform | null) => void;
   dxfOverlay?: FlightDxfOverlay | null;
   dxfStockpiles?: Stockpile[];
   showDxfOverlay?: boolean;
@@ -169,6 +172,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   external3DSource = null,
   customOrthoCanvas = null,
   onClearExternal3D,
+  onModelBoundsChange,
   dxfOverlay = null,
   dxfStockpiles = [],
   showDxfOverlay: controlledShowDxfOverlay,
@@ -329,6 +333,8 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   drawOpacityRef.current = drawOpacity;
   drawMaterialRef.current = drawMaterial;
   densityTonM3Ref.current = densityTonM3;
+  const onModelBoundsChangeRef = useRef(onModelBoundsChange);
+  onModelBoundsChangeRef.current = onModelBoundsChange;
   selectedShapeIdRef.current = selectedShapeId;
   isCssFullscreenRef.current = isCssFullscreen;
 
@@ -436,6 +442,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     refPlaneGroup: THREE.Group;
     externalHost: THREE.Group;
     externalAsset: Loaded3DAssetResult | null;
+    baseGrid: THREE.GridHelper;
     defaultOrthoTexture: THREE.CanvasTexture;
     customOrthoTexture: THREE.CanvasTexture | null;
     maxAniso: number;
@@ -815,19 +822,69 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     }
   };
 
-  const resetCameraView = () => {
-    setActivePreset('oblique');
+  const computeModelFramingGoal = (
+    preset: CameraPresetId,
+    exVal: number,
+    snapImmediate = false
+  ) => {
     const ctx = sceneRef.current;
     if (!ctx) return;
-    const visSpan =
-      hasExternalRef.current && ctx.externalAsset
-        ? ctx.externalAsset.normalizedHeightSpan
-        : computeDemVisualSpan(zMinMRef.current, zMaxMRef.current);
-    const targetY = Math.min(80, visSpan * 0.32 * exaggeration);
-    ctx.cameraGoal.target.set(0, targetY, 0);
-    ctx.cameraGoal.pos.set(270, Math.max(215, visSpan * 1.45 * exaggeration), 285);
-    ctx.cameraGoal.active = true;
+
+    const dirVec =
+      preset === 'nadir'
+        ? new THREE.Vector3(0, 1, 0.012).normalize()
+        : preset === 'north'
+        ? new THREE.Vector3(0, 0.28, -1).normalize()
+        : preset === 'east'
+        ? new THREE.Vector3(1, 0.28, 0).normalize()
+        : new THREE.Vector3(0.66, 0.56, 0.68).normalize();
+
+    const target = new THREE.Vector3(0, 0, 0);
+    let fitDist = 420;
+
+    if (hasExternalRef.current && ctx.externalAsset) {
+      ctx.externalAsset.group.scale.y = exVal;
+      ctx.externalAsset.group.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(ctx.externalAsset.group);
+      if (!box.isEmpty()) {
+        const size = new THREE.Vector3();
+        box.getCenter(target);
+        box.getSize(size);
+        const radius = Math.max(24, size.length() * 0.5);
+        const vFov = THREE.MathUtils.degToRad(ctx.camera.fov);
+        const aspect = Math.max(0.5, ctx.camera.aspect || 1.4);
+        const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect);
+        const distV = radius / Math.sin(vFov / 2);
+        const distH = radius / Math.sin(hFov / 2);
+        fitDist = Math.max(distV, distH) * 0.92;
+      }
+    } else {
+      const visSpan = computeDemVisualSpan(zMinMRef.current, zMaxMRef.current);
+      target.set(0, Math.min(80, visSpan * 0.32 * exVal), 0);
+      const radius = Math.max(120, Math.hypot(TERRAIN_SPAN_M, visSpan * exVal) * 0.5);
+      const vFov = THREE.MathUtils.degToRad(ctx.camera.fov);
+      const aspect = Math.max(0.5, ctx.camera.aspect || 1.4);
+      const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect);
+      fitDist = Math.max(radius / Math.sin(vFov / 2), radius / Math.sin(hFov / 2)) * 0.92;
+    }
+
+    const goalPos = target.clone().addScaledVector(dirVec, fitDist);
+    ctx.cameraGoal.target.copy(target);
+    ctx.cameraGoal.pos.copy(goalPos);
+    if (snapImmediate) {
+      ctx.camera.position.copy(goalPos);
+      ctx.controls.target.copy(target);
+      ctx.controls.update();
+      ctx.cameraGoal.active = false;
+    } else {
+      ctx.cameraGoal.active = true;
+    }
     ctx.requestRender();
+  };
+
+  const resetCameraView = () => {
+    setActivePreset('oblique');
+    computeModelFramingGoal('oblique', exaggeration);
   };
 
   const focusPin = (pin: DrawnPin3D) => {
@@ -1641,17 +1698,31 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         });
         if (hoverHit) {
           const baseY = hoverHit.y / Math.max(0.01, exaggerationRef.current);
-          setCursorCoords({
-            x: hoverHit.x * metersPerUnitRef.current,
-            z: hoverHit.z * metersPerUnitRef.current,
-            elevM: baseYToViewerZ(
-              baseY,
-              hasExternalRef.current,
-              externalHeightSpanRef.current,
-              zMinMRef.current,
-              zMaxMRef.current
-            ),
-          });
+          const cadT = hasExternalRef.current ? sceneRef.current?.externalAsset?.cadTransform : null;
+          if (cadT) {
+            const cad = scenePointToCadCoords(hoverHit.x, baseY, hoverHit.z, cadT);
+            setCursorCoords({
+              x: cad.easting,
+              z: cad.northing,
+              elevM: cad.elevation,
+            });
+          } else {
+            const utm = terrain.worldToUtm(
+              hoverHit.x * metersPerUnitRef.current,
+              hoverHit.z * metersPerUnitRef.current
+            );
+            setCursorCoords({
+              x: utm.easting,
+              z: utm.northing,
+              elevM: baseYToViewerZ(
+                baseY,
+                hasExternalRef.current,
+                externalHeightSpanRef.current,
+                zMinMRef.current,
+                zMaxMRef.current
+              ),
+            });
+          }
         } else {
           setCursorCoords(null);
         }
@@ -1675,17 +1746,31 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       if (hit) {
         const baseY = hit.y / Math.max(0.01, exaggerationRef.current);
         previewDrawPointRef.current = { x: hit.x, baseY, z: hit.z };
-        setCursorCoords({
-          x: hit.x * metersPerUnitRef.current,
-          z: hit.z * metersPerUnitRef.current,
-          elevM: baseYToViewerZ(
-            baseY,
-            hasExternalRef.current,
-            externalHeightSpanRef.current,
-            zMinMRef.current,
-            zMaxMRef.current
-          ),
-        });
+        const cadT = hasExternalRef.current ? sceneRef.current?.externalAsset?.cadTransform : null;
+        if (cadT) {
+          const cad = scenePointToCadCoords(hit.x, baseY, hit.z, cadT);
+          setCursorCoords({
+            x: cad.easting,
+            z: cad.northing,
+            elevM: cad.elevation,
+          });
+        } else {
+          const utm = terrain.worldToUtm(
+            hit.x * metersPerUnitRef.current,
+            hit.z * metersPerUnitRef.current
+          );
+          setCursorCoords({
+            x: utm.easting,
+            z: utm.northing,
+            elevM: baseYToViewerZ(
+              baseY,
+              hasExternalRef.current,
+              externalHeightSpanRef.current,
+              zMinMRef.current,
+              zMaxMRef.current
+            ),
+          });
+        }
       } else {
         previewDrawPointRef.current = null;
         setCursorCoords(null);
@@ -1885,6 +1970,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       refPlaneGroup,
       externalHost,
       externalAsset: null,
+      baseGrid,
       defaultOrthoTexture: orthoTexture,
       customOrthoTexture: null,
       maxAniso,
@@ -2009,6 +2095,8 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
 
     if (!external3DSource) {
       clearExistingExternal();
+      ctx.baseGrid.position.y = -14.2;
+      onModelBoundsChangeRef.current?.(null);
       metersPerUnitRef.current = 1;
       zMinMRef.current = demElevationBoundsRef.current.minM;
       zMaxMRef.current = demElevationBoundsRef.current.maxM;
@@ -2056,8 +2144,10 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         ctx.externalAsset = asset;
         asset.group.scale.y = exaggerationRef.current;
         ctx.externalHost.add(asset.group);
+        ctx.baseGrid.position.y = -0.5;
 
         syncAutoZFromExternalAsset(asset);
+        onModelBoundsChangeRef.current?.({ ...asset.cadTransform });
 
         setExternalInfo({
           count: asset.pointOrVertexCount,
@@ -2069,13 +2159,13 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         ctx.rebuildDrawOverlay();
         ctx.rebuildDxfOverlay();
 
-        // Smoothly reframe oblique view only when loading a new 3D asset
+        // Center viewer on true model center & fit to viewport when loading a new 3D asset
         if (isNewSource) {
-          ctx.cameraGoal.target.set(0, Math.min(40, asset.normalizedHeightSpan * 0.35), 0);
-          ctx.cameraGoal.pos.set(240, 215, 250);
-          ctx.cameraGoal.active = true;
+          setActivePreset('oblique');
+          computeModelFramingGoal('oblique', exaggerationRef.current, true);
+        } else {
+          ctx.requestRender();
         }
-        ctx.requestRender();
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -2193,29 +2283,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   // Apply Camera Preset smoothly
   const applyCameraPreset = (preset: CameraPresetId) => {
     setActivePreset(preset);
-    const ctx = sceneRef.current;
-    if (!ctx) return;
-    const ex = exaggeration;
-    const visSpan =
-      hasExternalRef.current && ctx.externalAsset
-        ? ctx.externalAsset.normalizedHeightSpan
-        : computeDemVisualSpan(zMinM, zMaxM);
-    const targetY = Math.min(80, visSpan * 0.32 * ex);
-    if (preset === 'nadir') {
-      ctx.cameraGoal.pos.set(0, 440, 4);
-      ctx.cameraGoal.target.set(0, targetY, 0);
-    } else if (preset === 'oblique') {
-      ctx.cameraGoal.pos.set(270, Math.max(215, visSpan * 1.45 * ex), 285);
-      ctx.cameraGoal.target.set(0, targetY, 0);
-    } else if (preset === 'north') {
-      ctx.cameraGoal.pos.set(0, Math.max(96, visSpan * 0.85 * ex), -340);
-      ctx.cameraGoal.target.set(0, targetY, 0);
-    } else if (preset === 'east') {
-      ctx.cameraGoal.pos.set(340, Math.max(96, visSpan * 0.85 * ex), 0);
-      ctx.cameraGoal.target.set(0, targetY, 0);
-    }
-    ctx.cameraGoal.active = true;
-    ctx.requestRender();
+    computeModelFramingGoal(preset, exaggeration);
   };
 
   // Focus camera on a DXF 3D polygon & open its stockpile inspection card
@@ -2447,9 +2515,10 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
                       ctx.externalAsset.setHypsometricMode(renderMode === 'hipsometria');
                       ctx.externalAsset.setWireframeMode(renderMode === 'tin');
                       syncAutoZFromExternalAsset(ctx.externalAsset);
+                      onModelBoundsChangeRef.current?.({ ...ctx.externalAsset.cadTransform });
                       ctx.rebuildDrawOverlay();
                       ctx.rebuildDxfOverlay();
-                      ctx.requestRender();
+                      computeModelFramingGoal(activePreset, exaggeration);
                     }
                   }}
                   className="px-2 py-1 rounded text-[10px] font-mono bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/40 inline-flex items-center gap-1 cursor-pointer"
@@ -3223,10 +3292,24 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
                                   {pin.note}
                                 </div>
                               )}
-                              <div className="font-mono text-[9.5px] text-cyan-300 truncate">
-                                Z: {formatEsNumber(cotaZ, 2)} m · E {formatEsNumber(pin.point.x * metersPerUnitRef.current, 1)} · N{' '}
-                                {formatEsNumber(pin.point.z * metersPerUnitRef.current, 1)}
-                              </div>
+                              {(() => {
+                                const cadT = sceneRef.current?.externalAsset?.cadTransform;
+                                const pinCoords = cadT
+                                  ? scenePointToCadCoords(pin.point.x, pin.point.baseY, pin.point.z, cadT)
+                                  : (() => {
+                                      const u = terrain.worldToUtm(
+                                        pin.point.x * metersPerUnitRef.current,
+                                        pin.point.z * metersPerUnitRef.current
+                                      );
+                                      return { easting: u.easting, northing: u.northing, elevation: cotaZ };
+                                    })();
+                                return (
+                                  <div className="font-mono text-[9.5px] text-cyan-300 truncate">
+                                    Z: {formatEsNumber(pinCoords.elevation, 2)} m · E {formatEsNumber(pinCoords.easting, 1)} · N{' '}
+                                    {formatEsNumber(pinCoords.northing, 1)}
+                                  </div>
+                                );
+                              })()}
                             </div>
                           </div>
                           <div className="flex items-center gap-0.5 shrink-0">

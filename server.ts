@@ -9,6 +9,10 @@ import {
   autoMatchDxfPolygonsToStockpiles,
   parseDxfOverlayText,
 } from './src/utils/dxfOverlayParser.ts';
+import {
+  groupPdfTextItemsIntoLines,
+  parse3DsurveyMeasurementsLines,
+} from './src/utils/pdfMeasurementsParser.ts';
 import type { FlightDxfOverlay, Stockpile } from './src/types.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -1919,6 +1923,69 @@ async function startServer(): Promise<void> {
 
     res.json({ deleted: true, stockpileId });
   });
+
+  // --------------------------------------------------------------------------
+  // 3DSURVEY MEASUREMENTS PDF EXTRACTION ENDPOINT (Admin Only)
+  // --------------------------------------------------------------------------
+  app.post(
+    '/api/stockpiles/parse-pdf',
+    requireAuth,
+    requireAdmin,
+    upload.single('file'),
+    async (req: Request, res: Response) => {
+      const uploadedPath = req.file?.path;
+      try {
+        if (!req.file || !uploadedPath) {
+          res.status(400).json({ error: 'Debes adjuntar un archivo PDF válido.' });
+          return;
+        }
+        const originalName = req.file.originalname || 'mediciones.pdf';
+        if (!originalName.toLowerCase().endsWith('.pdf')) {
+          res.status(400).json({ error: 'El archivo seleccionado debe tener extensión .pdf.' });
+          return;
+        }
+
+        const pdfBuffer = fs.readFileSync(uploadedPath);
+        const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
+        const loadingTask = pdfjsLib.getDocument({
+          data: new Uint8Array(pdfBuffer),
+          disableFontFace: true,
+          verbosity: 0,
+        });
+        const doc = await loadingTask.promise;
+
+        const allLines: string[] = [];
+        for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+          const page = await doc.getPage(pageNum);
+          const textContent = await page.getTextContent();
+          allLines.push(...groupPdfTextItemsIntoLines(textContent.items));
+        }
+
+        const parsed = parse3DsurveyMeasurementsLines(allLines, originalName);
+        if (parsed.items.length === 0) {
+          res.status(422).json({
+            error:
+              'No se detectaron bloques de volumen de acopios en el PDF (formato esperado: informe de mediciones 3Dsurvey con Nombre, Relleno, Desmonte, Neto, Área 2D).',
+          });
+          return;
+        }
+
+        res.json({
+          ok: true,
+          fileName: originalName,
+          pageCount: doc.numPages,
+          ...parsed,
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Error al procesar el archivo PDF.';
+        res.status(500).json({ error: msg });
+      } finally {
+        if (uploadedPath) {
+          unlinkFileSafe(uploadedPath);
+        }
+      }
+    }
+  );
 
   // --------------------------------------------------------------------------
   // FLIGHT 3D DXF OVERLAY ENDPOINTS (Admin upload/assign/delete; Client view/download)

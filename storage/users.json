@@ -1,0 +1,49 @@
+[
+  {
+    "id": 1,
+    "uid": "user_admin_01",
+    "username": "admin",
+    "email": "admin@ingeodron.es",
+    "passwordHash": "ingeodron_salt_01:c0ad51a01749ac1c1a9d1e6e2f42a703a277514ca688110a3fb2f3eec992331ad1ae13130f6651ac0734cc31ffacd0db36deadd82f8083769b5386aa06afadd0",
+    "displayName": "Administrador Técnico INGEODRON",
+    "role": "admin",
+    "active": true,
+    "createdAt": "2026-01-10T08:00:00.000Z"
+  },
+  {
+    "id": 2,
+    "uid": "user_client_01",
+    "username": "cmorales",
+    "email": "cmorales@aridosdelsur.es",
+    "passwordHash": "ingeodron_salt_02:3b5c7fd75fd46e7e36a4f3f7d45e02ab04f189d3a298fe5fed3482fbb33427e62d8b0722f8ea808087f53c43880242c7294b6bf8497915166c6ac389867566e8",
+    "displayName": "Carlos M. Morales — Áridos del Sur",
+    "role": "client",
+    "clientId": 1,
+    "active": true,
+    "createdAt": "2026-01-15T08:30:00.000Z"
+  },
+  {
+    "id": 3,
+    "uid": "user_client_02",
+    "username": "eramos",
+    "email": "eramos@gravasmadrid.es",
+    "passwordHash": "ingeodron_salt_03:91469c7835a5de3d85cc8e8f65c73d88d6c84ad8619e65b068e03c3f7f7a53989a12f5b079086a08146ada430f33ff6cd3fdb601903ab3a9963b7b0acfecee04",
+    "displayName": "Elena Ramos — Gravas Madrid",
+    "role": "client",
+    "clientId": 2,
+    "active": true,
+    "createdAt": "2026-03-10T09:45:00.000Z"
+  },
+  {
+    "id": 4,
+    "uid": "user_client_03",
+    "username": "fvidal",
+    "email": "f.vidal@mineriaridos.es",
+    "passwordHash": "ingeodron_salt_04:555f876c5983fc35da26c22c079f2e0b334e8175de92225835293140402b6edb926f464b619426661ff5fee69e17d9de222be77a7a7b33ce8b3a0d9d4a671387",
+    "displayName": "Francisco Vidal — Minería Levante",
+    "role": "client",
+    "clientId": 3,
+    "active": true,
+    "createdAt": "2026-04-22T10:30:00.000Z"
+  }
+]

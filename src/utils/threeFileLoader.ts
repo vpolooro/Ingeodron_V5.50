@@ -37,6 +37,70 @@ export function isSupportedOrthoFileName(fileName: string): boolean {
   return SUPPORTED_ORTHO_EXTENSIONS.includes(getFileExtension(fileName));
 }
 
+export interface CadTransform {
+  sourceOrigin: { x: number; y: number; z: number };
+  center: { x: number; y: number; z: number };
+  boxMinY: number;
+  scaleFactor: number;
+  zUp: boolean;
+  cadMin: { x: number; y: number; z: number };
+  cadMax: { x: number; y: number; z: number };
+}
+
+export interface PlanCoordinateBounds {
+  minE: number;
+  maxE: number;
+  minN: number;
+  maxN: number;
+  source: 'geotiff' | 'model3d' | 'dxf' | 'local';
+}
+
+export interface LoadedOrthophotoResult {
+  canvas: HTMLCanvasElement;
+  naturalWidth: number;
+  naturalHeight: number;
+  geoBounds: PlanCoordinateBounds | null;
+}
+
+export function scenePointToCadCoords(
+  worldX: number,
+  baseY: number,
+  worldZ: number,
+  cadTransform: CadTransform
+): { easting: number; northing: number; elevation: number } {
+  const s = Math.max(1e-9, cadTransform.scaleFactor);
+  if (cadTransform.zUp) {
+    return {
+      easting: worldX / s + cadTransform.center.x + cadTransform.sourceOrigin.x,
+      northing: -(worldZ / s + cadTransform.center.z) + cadTransform.sourceOrigin.y,
+      elevation: baseY / s + cadTransform.boxMinY + cadTransform.sourceOrigin.z,
+    };
+  }
+  return {
+    easting: worldX / s + cadTransform.center.x + cadTransform.sourceOrigin.x,
+    northing: worldZ / s + cadTransform.center.z + cadTransform.sourceOrigin.z,
+    elevation: baseY / s + cadTransform.boxMinY + cadTransform.sourceOrigin.y,
+  };
+}
+
+export function cadTransformToPlanBounds(cadTransform: CadTransform): PlanCoordinateBounds | null {
+  const minE = cadTransform.cadMin.x;
+  const maxE = cadTransform.cadMax.x;
+  const minN = cadTransform.zUp ? cadTransform.cadMin.y : cadTransform.cadMin.z;
+  const maxN = cadTransform.zUp ? cadTransform.cadMax.y : cadTransform.cadMax.z;
+  if (
+    !Number.isFinite(minE) ||
+    !Number.isFinite(maxE) ||
+    !Number.isFinite(minN) ||
+    !Number.isFinite(maxN) ||
+    maxE <= minE ||
+    maxN <= minN
+  ) {
+    return null;
+  }
+  return { minE, maxE, minN, maxN, source: 'model3d' };
+}
+
 export interface Load3DAssetOptions {
   maxPoints?: number;
   pointSize?: number;
@@ -52,15 +116,7 @@ export interface Loaded3DAssetResult {
   rawBoundsMax: THREE.Vector3;
   normalizedHeightSpan: number;
   hasTextures: boolean;
-  cadTransform: {
-    sourceOrigin: { x: number; y: number; z: number };
-    center: { x: number; y: number; z: number };
-    boxMinY: number;
-    scaleFactor: number;
-    zUp: boolean;
-    cadMin: { x: number; y: number; z: number };
-    cadMax: { x: number; y: number; z: number };
-  };
+  cadTransform: CadTransform;
   setHypsometricMode: (enabled: boolean) => void;
   setWireframeMode: (enabled: boolean) => void;
   setZUpOrientation: (zUp: boolean) => void;
@@ -1013,10 +1069,129 @@ export async function load3DAssetFromUrl(
   };
 }
 
-export async function loadOrthophotoCanvasFromUrl(
+export function extractGeoTiffBounds(
+  buffer: ArrayBuffer,
+  widthPx: number,
+  heightPx: number
+): PlanCoordinateBounds | null {
+  if (buffer.byteLength < 16 || widthPx <= 0 || heightPx <= 0) return null;
+  try {
+    const view = new DataView(buffer);
+    const endian = view.getUint16(0, false);
+    const littleEndian = endian === 0x4949 ? true : endian === 0x4d4d ? false : null;
+    if (littleEndian === null) return null;
+
+    const magic = view.getUint16(2, littleEndian);
+    if (magic !== 42) return null;
+
+    const ifdOffset = view.getUint32(4, littleEndian);
+    if (ifdOffset <= 0 || ifdOffset + 2 > buffer.byteLength) return null;
+
+    const entryCount = view.getUint16(ifdOffset, littleEndian);
+    let pixelScale: number[] | null = null;
+    let tiepoints: number[] | null = null;
+    let modelTransform: number[] | null = null;
+
+    const readDoubleArray = (type: number, count: number, valueOffset: number): number[] | null => {
+      // Tag type 12 = IEEE DOUBLE (8 bytes per value)
+      if (type !== 12 || count <= 0) return null;
+      const bytes = count * 8;
+      if (valueOffset < 0 || valueOffset + bytes > buffer.byteLength) return null;
+      const out: number[] = [];
+      for (let i = 0; i < count; i++) {
+        out.push(view.getFloat64(valueOffset + i * 8, littleEndian));
+      }
+      return out;
+    };
+
+    for (let i = 0; i < entryCount; i++) {
+      const entryOff = ifdOffset + 2 + i * 12;
+      if (entryOff + 12 > buffer.byteLength) break;
+      const tag = view.getUint16(entryOff, littleEndian);
+      const type = view.getUint16(entryOff + 2, littleEndian);
+      const count = view.getUint32(entryOff + 4, littleEndian);
+      const valOff = view.getUint32(entryOff + 8, littleEndian);
+
+      if (tag === 33550) {
+        pixelScale = readDoubleArray(type, count, valOff);
+      } else if (tag === 33922) {
+        tiepoints = readDoubleArray(type, count, valOff);
+      } else if (tag === 34264) {
+        modelTransform = readDoubleArray(type, count, valOff);
+      }
+    }
+
+    if (pixelScale && pixelScale.length >= 2 && tiepoints && tiepoints.length >= 6) {
+      const sx = pixelScale[0];
+      const sy = pixelScale[1];
+      const i = tiepoints[0];
+      const j = tiepoints[1];
+      const x = tiepoints[3];
+      const y = tiepoints[4];
+      if (sx > 0 && sy > 0 && Number.isFinite(x) && Number.isFinite(y)) {
+        const minE = x - i * sx;
+        const maxE = minE + widthPx * sx;
+        const maxN = y + j * sy;
+        const minN = maxN - heightPx * sy;
+        if (
+          Number.isFinite(minE) &&
+          Number.isFinite(maxE) &&
+          Number.isFinite(minN) &&
+          Number.isFinite(maxN) &&
+          maxE > minE &&
+          maxN > minN
+        ) {
+          return { minE, maxE, minN, maxN, source: 'geotiff' };
+        }
+      }
+    }
+
+    if (modelTransform && modelTransform.length >= 8) {
+      const a = modelTransform[0];
+      const b = modelTransform[1];
+      const d = modelTransform[3];
+      const e = modelTransform[4];
+      const f = modelTransform[5];
+      const h = modelTransform[7];
+      const corners: Array<[number, number]> = [
+        [0, 0],
+        [widthPx, 0],
+        [0, heightPx],
+        [widthPx, heightPx],
+      ];
+      let minE = Infinity;
+      let maxE = -Infinity;
+      let minN = Infinity;
+      let maxN = -Infinity;
+      for (const [px, py] of corners) {
+        const cx = a * px + b * py + d;
+        const cy = e * px + f * py + h;
+        if (cx < minE) minE = cx;
+        if (cx > maxE) maxE = cx;
+        if (cy < minN) minN = cy;
+        if (cy > maxN) maxN = cy;
+      }
+      if (
+        Number.isFinite(minE) &&
+        Number.isFinite(maxE) &&
+        Number.isFinite(minN) &&
+        Number.isFinite(maxN) &&
+        maxE > minE &&
+        maxN > minN
+      ) {
+        return { minE, maxE, minN, maxN, source: 'geotiff' };
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+export async function loadOrthophotoDataFromUrl(
   url: string,
   fileName: string
-): Promise<HTMLCanvasElement> {
+): Promise<LoadedOrthophotoResult> {
   const ext = getFileExtension(fileName);
   if (ext === '.tif' || ext === '.tiff') {
     const resp = await fetch(url);
@@ -1036,11 +1211,20 @@ export async function loadOrthophotoCanvasFromUrl(
     };
     const rawW = img.width || 512;
     const rawH = img.height || 512;
+    const geoBounds = extractGeoTiffBounds(buf, rawW, rawH);
+
     const rawCanvas = document.createElement('canvas');
     rawCanvas.width = rawW;
     rawCanvas.height = rawH;
     const rawCtx = rawCanvas.getContext('2d');
-    if (!rawCtx || !img.data || img.data.length === 0) return rawCanvas;
+    if (!rawCtx || !img.data || img.data.length === 0) {
+      return {
+        canvas: rawCanvas,
+        naturalWidth: rawW,
+        naturalHeight: rawH,
+        geoBounds,
+      };
+    }
     const out = rawCtx.createImageData(rawW, rawH);
     const src = img.data;
     const totalPx = rawW * rawH;
@@ -1058,7 +1242,12 @@ export async function loadOrthophotoCanvasFromUrl(
 
     const maxDim = 4096;
     if (Math.max(rawW, rawH) <= maxDim) {
-      return rawCanvas;
+      return {
+        canvas: rawCanvas,
+        naturalWidth: rawW,
+        naturalHeight: rawH,
+        geoBounds,
+      };
     }
     const scale = maxDim / Math.max(rawW, rawH);
     const scaled = document.createElement('canvas');
@@ -1070,10 +1259,15 @@ export async function loadOrthophotoCanvasFromUrl(
       sCtx.imageSmoothingQuality = 'high';
       sCtx.drawImage(rawCanvas, 0, 0, scaled.width, scaled.height);
     }
-    return scaled;
+    return {
+      canvas: scaled,
+      naturalWidth: rawW,
+      naturalHeight: rawH,
+      geoBounds,
+    };
   }
 
-  return new Promise<HTMLCanvasElement>((resolve, reject) => {
+  return new Promise<LoadedOrthophotoResult>((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
@@ -1088,9 +1282,22 @@ export async function loadOrthophotoCanvasFromUrl(
         ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       }
-      resolve(canvas);
+      resolve({
+        canvas,
+        naturalWidth: img.width,
+        naturalHeight: img.height,
+        geoBounds: null,
+      });
     };
     img.onerror = () => reject(new Error('No se pudo decodificar la imagen de ortofoto.'));
     img.src = url;
   });
+}
+
+export async function loadOrthophotoCanvasFromUrl(
+  url: string,
+  fileName: string
+): Promise<HTMLCanvasElement> {
+  const result = await loadOrthophotoDataFromUrl(url, fileName);
+  return result.canvas;
 }

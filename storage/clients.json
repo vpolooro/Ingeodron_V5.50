@@ -1,0 +1,29 @@
+[
+  {
+    "id": 1,
+    "code": "C101",
+    "name": "Áridos y Canteras del Sur S.A.",
+    "cif": "B-91823746",
+    "contactName": "Carlos M. Morales (Jefe de Explotación)",
+    "contactEmail": "cmorales@aridosdelsur.es",
+    "viewer3dEnabled": true
+  },
+  {
+    "id": 2,
+    "code": "C110",
+    "name": "Hormigones y Gravas Madrid S.L.",
+    "cif": "B-28941029",
+    "contactName": "Elena Ramos (Directora Técnica)",
+    "contactEmail": "eramos@gravasmadrid.es",
+    "viewer3dEnabled": false
+  },
+  {
+    "id": 3,
+    "code": "C120",
+    "name": "Minería y Áridos del Levante S.A.",
+    "cif": "A-03194821",
+    "contactName": "Francisco Vidal",
+    "contactEmail": "f.vidal@mineriaridos.es",
+    "viewer3dEnabled": false
+  }
+]

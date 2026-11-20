@@ -39,6 +39,7 @@ import { ClientsUsersAdminPanel } from './components/ClientsUsersAdminPanel.tsx'
 import { ActiveFlightStockpilesChart } from './components/ActiveFlightStockpilesChart.tsx';
 import { ConfirmDialog } from './components/ConfirmDialog.tsx';
 import { CsvImportModal } from './components/CsvImportModal.tsx';
+import { PdfMeasurementsImportModal } from './components/PdfMeasurementsImportModal.tsx';
 import { PhotogrammetryWorkspace } from './components/PhotogrammetryWorkspace.tsx';
 import { SortableTh } from './components/SortableTh.tsx';
 import { MultiFlightSelect } from './components/MultiFlightSelect.tsx';
@@ -299,6 +300,7 @@ export default function App() {
   const [showUploadDeliverableModal, setShowUploadDeliverableModal] = useState<boolean>(false);
   const [showWorkspaceCsvModal, setShowWorkspaceCsvModal] = useState<boolean>(false);
   const [workspaceCsvMode, setWorkspaceCsvMode] = useState<CsvImportMode>('flights');
+  const [showPdfMeasurementsModal, setShowPdfMeasurementsModal] = useState<boolean>(false);
   const [confirmDialog, setConfirmDialog] = useState<{
     open: boolean;
     title: string;
@@ -3885,6 +3887,14 @@ export default function App() {
                             </button>
                             <button
                               type="button"
+                              onClick={() => setShowPdfMeasurementsModal(true)}
+                              className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold rounded-lg shadow flex items-center gap-1 transition cursor-pointer"
+                              title="Extraer e importar automáticamente todos los acopios desde un PDF de mediciones (3Dsurvey)"
+                            >
+                              <FileText className="w-3.5 h-3.5" /> Importar PDF
+                            </button>
+                            <button
+                              type="button"
                               onClick={handleOpenAddZone}
                               className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-cyan-300 border border-gray-700 text-xs font-semibold rounded-lg flex items-center gap-1 transition cursor-pointer"
                             >
@@ -6219,6 +6229,22 @@ export default function App() {
         stockpiles={stockpiles}
         defaultClientId={activeClient?.id ?? 'auto'}
         onClose={() => setShowWorkspaceCsvModal(false)}
+        onSuccess={async (title, message) => {
+          await fetchData();
+          showToast(title, message);
+        }}
+      />
+
+      <PdfMeasurementsImportModal
+        open={showPdfMeasurementsModal}
+        clients={clients}
+        quarries={quarries}
+        zones={zones}
+        surveys={surveys}
+        stockpiles={stockpiles}
+        defaultClientId={activeClient?.id}
+        defaultSurveyId={activeFlight?.id}
+        onClose={() => setShowPdfMeasurementsModal(false)}
         onSuccess={async (title, message) => {
           await fetchData();
           showToast(title, message);

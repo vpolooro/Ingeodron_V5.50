@@ -31,7 +31,6 @@ import {
 import {
   ELEV_MAX_M,
   ELEV_MIN_M,
-  TERRAIN_HALF_M,
   TERRAIN_SPAN_M,
   extractContours,
   renderHypsometryCanvas,
@@ -53,6 +52,7 @@ import {
 } from '../utils/drawing3DOverlay.ts';
 import { exportProfile2DDxf, exportProfile3DDxf } from '../utils/dxfProfileExporter.ts';
 import { createDxfWorldMapper } from '../utils/dxfOverlayParser.ts';
+import type { PlanCoordinateBounds } from '../utils/threeFileLoader.ts';
 import type { FlightDxfOverlay, Quarry, Stockpile, Survey } from '../types.ts';
 import { formatDateEu } from '../utils/dateUtils.ts';
 import { formatEsInt, formatEsNumber } from '../utils/numberFormat.ts';
@@ -65,6 +65,8 @@ interface Quarry2DOrthophotoViewerProps {
   activeFlight?: Survey;
   terrain: QuarryTerrainData;
   customOrthoCanvas?: HTMLCanvasElement | null;
+  orthoNaturalSize?: { width: number; height: number } | null;
+  planBounds?: PlanCoordinateBounds | null;
   dxfOverlay?: FlightDxfOverlay | null;
   dxfStockpiles?: Stockpile[];
   showDxfOverlay?: boolean;
@@ -72,8 +74,6 @@ interface Quarry2DOrthophotoViewerProps {
   dxfOpacity?: number;
   onChangeDxfOpacity?: (opacity: number) => void;
 }
-
-const BASE_CANVAS_PX = 800; // 2 px per meter at zoom 1.0 (800px = 400m)
 
 const ELEVATION_STOPS = [
   { elev: 1000, color: '#f8fafc' },
@@ -111,6 +111,8 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
   activeFlight,
   terrain,
   customOrthoCanvas = null,
+  orthoNaturalSize = null,
+  planBounds = null,
   dxfOverlay = null,
   dxfStockpiles = [],
   showDxfOverlay: controlledShowDxfOverlay,
@@ -164,9 +166,32 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
   const isCssFullscreenRef = useRef<boolean>(false);
   isCssFullscreenRef.current = isCssFullscreen;
 
-  // Pan & Zoom state
+  // Viewport size tracking for distortion-free auto-fit centering
+  const [viewportSize, setViewportSize] = useState<{ w: number; h: number }>({ w: 800, h: 560 });
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+    const updateSize = () => {
+      const rect = el.getBoundingClientRect();
+      const nextW = Math.max(240, Math.round(rect.width));
+      const nextH = Math.max(240, Math.round(rect.height));
+      setViewportSize((prev) =>
+        prev.w === nextW && prev.h === nextH ? prev : { w: nextW, h: nextH }
+      );
+    };
+    updateSize();
+    const ro = new ResizeObserver(updateSize);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [isFullscreen]);
+
+  // Pan & Zoom state (starts centered and fitted to viewport)
   const [zoom, setZoom] = useState<number>(1.0);
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  useEffect(() => {
+    setZoom(1.0);
+    setPan({ x: 0, y: 0 });
+  }, [customOrthoCanvas]);
   const dragRef = useRef<{
     active: boolean;
     startX: number;
@@ -255,20 +280,120 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
     [zMinM]
   );
 
+  // Natural orthophoto dimensions & aspect-locked canvas / fitted viewport box
+  const imgWidth = Math.max(1, orthoNaturalSize?.width || customOrthoCanvas?.width || 800);
+  const imgHeight = Math.max(1, orthoNaturalSize?.height || customOrthoCanvas?.height || 800);
+  const imgAspect = imgWidth / imgHeight;
+
+  const { canvasW, canvasH } = useMemo(() => {
+    const longest = Math.max(imgWidth, imgHeight);
+    const targetLongest = Math.min(1800, Math.max(900, longest));
+    const scale = targetLongest / longest;
+    return {
+      canvasW: Math.max(64, Math.round(imgWidth * scale)),
+      canvasH: Math.max(64, Math.round(imgHeight * scale)),
+    };
+  }, [imgWidth, imgHeight]);
+
+  const { displayW, displayH } = useMemo(() => {
+    const availW = Math.max(220, viewportSize.w - 32);
+    const availH = Math.max(220, viewportSize.h - 32);
+    let w = availW;
+    let h = w / imgAspect;
+    if (h > availH) {
+      h = availH;
+      w = h * imgAspect;
+    }
+    return {
+      displayW: Math.max(120, Math.round(w)),
+      displayH: Math.max(120, Math.round(h)),
+    };
+  }, [viewportSize.w, viewportSize.h, imgAspect]);
+
+  // Resolved plan coordinate system matching the loaded model/orthophoto/DXF
+  const planSystem = useMemo(() => {
+    if (planBounds) {
+      const rawSpanE = Math.max(1e-3, planBounds.maxE - planBounds.minE);
+      const rawSpanN = Math.max(1e-3, planBounds.maxN - planBounds.minN);
+      const centerE = (planBounds.minE + planBounds.maxE) * 0.5;
+      const centerN = (planBounds.minN + planBounds.maxN) * 0.5;
+      if (planBounds.source === 'geotiff') {
+        return {
+          minE: planBounds.minE,
+          maxE: planBounds.maxE,
+          minN: planBounds.minN,
+          maxN: planBounds.maxN,
+          centerE,
+          centerN,
+          spanE: rawSpanE,
+          spanN: rawSpanN,
+          halfSpanE: rawSpanE * 0.5,
+          halfSpanN: rawSpanN * 0.5,
+          source: 'geotiff' as const,
+        };
+      }
+      let spanE = rawSpanE;
+      let spanN = spanE / imgAspect;
+      if (spanN < rawSpanN) {
+        spanN = rawSpanN;
+        spanE = spanN * imgAspect;
+      }
+      return {
+        minE: centerE - spanE * 0.5,
+        maxE: centerE + spanE * 0.5,
+        minN: centerN - spanN * 0.5,
+        maxN: centerN + spanN * 0.5,
+        centerE,
+        centerN,
+        spanE,
+        spanN,
+        halfSpanE: spanE * 0.5,
+        halfSpanN: spanN * 0.5,
+        source: planBounds.source,
+      };
+    }
+
+    const spanE = imgAspect >= 1 ? TERRAIN_SPAN_M : TERRAIN_SPAN_M * imgAspect;
+    const spanN = imgAspect >= 1 ? TERRAIN_SPAN_M / imgAspect : TERRAIN_SPAN_M;
+    return {
+      minE: -spanE * 0.5,
+      maxE: spanE * 0.5,
+      minN: -spanN * 0.5,
+      maxN: spanN * 0.5,
+      centerE: 0,
+      centerN: 0,
+      spanE,
+      spanN,
+      halfSpanE: spanE * 0.5,
+      halfSpanN: spanN * 0.5,
+      source: 'local' as const,
+    };
+  }, [planBounds, imgAspect]);
+
+  const planWorldToCoords = useCallback(
+    (wx: number, wz: number) => ({
+      easting: planSystem.centerE + wx,
+      northing: planSystem.centerN - wz,
+    }),
+    [planSystem.centerE, planSystem.centerN]
+  );
+
   // Pre-rendered raster canvases (cached per terrain)
   const orthoBitmap = useMemo(() => renderOrthophotoCanvas(terrain, 640), [terrain]);
   const hypsoBitmap = useMemo(() => renderHypsometryCanvas(terrain, 640), [terrain]);
 
-  // Paint active base raster onto the scaled canvas
+  // Paint active base raster onto the aspect-matched canvas
   useEffect(() => {
     const canvas = orthoHostRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const src = baseLayer === 'hipsometria' ? hypsoBitmap : customOrthoCanvas || orthoBitmap;
-    ctx.clearRect(0, 0, BASE_CANVAS_PX, BASE_CANVAS_PX);
-    ctx.drawImage(src, 0, 0, BASE_CANVAS_PX, BASE_CANVAS_PX);
-  }, [baseLayer, customOrthoCanvas, orthoBitmap, hypsoBitmap]);
+    ctx.clearRect(0, 0, canvasW, canvasH);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(src, 0, 0, canvasW, canvasH);
+  }, [baseLayer, customOrthoCanvas, orthoBitmap, hypsoBitmap, canvasW, canvasH]);
 
   // Vector contours
   const contours = useMemo(
@@ -324,13 +449,13 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
     setIsCssFullscreen(true);
   }, []);
 
-  // Coordinate conversions: world meters [-200..200] <-> SVG/Canvas px [0..BASE_CANVAS_PX]
+  // Coordinate conversions: centered plan meters <-> SVG/Canvas px [0..canvasW x 0..canvasH]
   const worldToSvg = useCallback(
     (wx: number, wz: number) => ({
-      x: ((wx + TERRAIN_HALF_M) / TERRAIN_SPAN_M) * BASE_CANVAS_PX,
-      y: ((wz + TERRAIN_HALF_M) / TERRAIN_SPAN_M) * BASE_CANVAS_PX,
+      x: ((wx + planSystem.halfSpanE) / planSystem.spanE) * canvasW,
+      y: ((wz + planSystem.halfSpanN) / planSystem.spanN) * canvasH,
     }),
-    []
+    [planSystem.halfSpanE, planSystem.spanE, planSystem.halfSpanN, planSystem.spanN, canvasW, canvasH]
   );
 
   const screenToWorld = useCallback(
@@ -340,15 +465,26 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
       const rect = el.getBoundingClientRect();
       const cx = rect.width / 2 + pan.x;
       const cy = rect.height / 2 + pan.y;
-      const scaledSize = BASE_CANVAS_PX * zoom;
-      const relX = (clientX - rect.left - (cx - scaledSize / 2)) / scaledSize;
-      const relY = (clientY - rect.top - (cy - scaledSize / 2)) / scaledSize;
+      const scaledW = displayW * zoom;
+      const scaledH = displayH * zoom;
+      const relX = (clientX - rect.left - (cx - scaledW / 2)) / scaledW;
+      const relY = (clientY - rect.top - (cy - scaledH / 2)) / scaledH;
       if (relX < 0 || relX > 1 || relY < 0 || relY > 1) return null;
-      const wx = -TERRAIN_HALF_M + relX * TERRAIN_SPAN_M;
-      const wz = -TERRAIN_HALF_M + relY * TERRAIN_SPAN_M;
+      const wx = -planSystem.halfSpanE + relX * planSystem.spanE;
+      const wz = -planSystem.halfSpanN + relY * planSystem.spanN;
       return { wx, wz };
     },
-    [pan.x, pan.y, zoom]
+    [
+      pan.x,
+      pan.y,
+      zoom,
+      displayW,
+      displayH,
+      planSystem.halfSpanE,
+      planSystem.spanE,
+      planSystem.halfSpanN,
+      planSystem.spanN,
+    ]
   );
 
   // Smooth pan to center on any world coordinate (used by Stockpiles, Shapes & Pins)
@@ -356,15 +492,15 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
     (wx: number, wz: number, targetZoom?: number) => {
       const nextZoom = targetZoom ?? Math.max(zoom, 1.8);
       const svgPt = worldToSvg(wx, wz);
-      const dxFromCenter = svgPt.x - BASE_CANVAS_PX / 2;
-      const dyFromCenter = svgPt.y - BASE_CANVAS_PX / 2;
+      const dxDisplay = (svgPt.x / canvasW - 0.5) * displayW;
+      const dyDisplay = (svgPt.y / canvasH - 0.5) * displayH;
       setZoom(nextZoom);
       setPan({
-        x: Math.round(-dxFromCenter * nextZoom),
-        y: Math.round(-dyFromCenter * nextZoom),
+        x: Math.round(-dxDisplay * nextZoom),
+        y: Math.round(-dyDisplay * nextZoom),
       });
     },
-    [worldToSvg, zoom]
+    [worldToSvg, zoom, canvasW, canvasH, displayW, displayH]
   );
 
   const focusShape = useCallback(
@@ -394,11 +530,22 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
     if (!dxfOverlay) return [];
     const mapper = createDxfWorldMapper(dxfOverlay, {
       terrainOriginUtm: { e0: terrain.utmOriginE, n0: terrain.utmOriginN },
-      terrainSpanM: TERRAIN_SPAN_M,
-      terrainHalfM: TERRAIN_HALF_M,
+      terrainSpanM: Math.max(planSystem.spanE, planSystem.spanN),
+      terrainHalfM: Math.max(planSystem.halfSpanE, planSystem.halfSpanN),
       demElevMinM: zMinM,
       demElevMaxM: zMaxM,
       hasExternal3D: false,
+      planWorldBounds:
+        planSystem.source !== 'local'
+          ? {
+              minE: planSystem.minE,
+              maxE: planSystem.maxE,
+              minN: planSystem.minN,
+              maxN: planSystem.maxN,
+              spanE: planSystem.spanE,
+              spanN: planSystem.spanN,
+            }
+          : null,
     });
     return dxfOverlay.polygons
       .filter((poly) => poly.visible !== false && poly.vertices.length >= 3)
@@ -425,7 +572,16 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
           assignedStockpile,
         };
       });
-  }, [dxfOverlay, dxfStockpiles, terrain.utmOriginE, terrain.utmOriginN, zMinM, zMaxM, worldToSvg]);
+  }, [
+    dxfOverlay,
+    dxfStockpiles,
+    terrain.utmOriginE,
+    terrain.utmOriginN,
+    zMinM,
+    zMaxM,
+    worldToSvg,
+    planSystem,
+  ]);
 
   const focusDxfPolygon = useCallback(
     (polyId: string) => {
@@ -636,11 +792,11 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
 
     const w = screenToWorld(e.clientX, e.clientY);
     if (w) {
-      const utm = terrain.worldToUtm(w.wx, w.wz);
+      const coords = planWorldToCoords(w.wx, w.wz);
       const elevM = terrain.sampleElevationAt(w.wx, w.wz);
       setCursorCoords({
-        easting: utm.easting,
-        northing: utm.northing,
+        easting: coords.easting,
+        northing: coords.northing,
         elevM,
         worldX: w.wx,
         worldZ: w.wz,
@@ -692,7 +848,11 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
       if (activeDrawPoints.length >= 3) {
         const firstSvg = worldToSvg(activeDrawPoints[0].x, activeDrawPoints[0].z);
         const curSvg = worldToSvg(pt.x, pt.z);
-        const distScreenPx = Math.hypot(curSvg.x - firstSvg.x, curSvg.y - firstSvg.y) * zoom;
+        const distScreenPx =
+          Math.hypot(
+            (curSvg.x - firstSvg.x) * (displayW / canvasW),
+            (curSvg.y - firstSvg.y) * (displayH / canvasH)
+          ) * zoom;
         if (distScreenPx <= 14) {
           commitDrawnShape('polygon', activeDrawPoints, kind);
           return;
@@ -724,22 +884,26 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
     }
   };
 
-  // Export High-Res PNG Screenshot of 2D Orthophoto + SVG Vector Overlays
+  // Export High-Res PNG Screenshot of 2D Orthophoto + SVG Vector Overlays (aspect-preserved)
   const captureScreenshotPng = useCallback(() => {
     const baseCanvas = orthoHostRef.current;
     const svgEl = svgOverlayRef.current;
     if (!baseCanvas) return;
 
-    const exportSize = 1600;
+    const maxExportEdge = 1600;
+    const aspect = canvasW / Math.max(1, canvasH);
+    const exportW = aspect >= 1 ? maxExportEdge : Math.max(1, Math.round(maxExportEdge * aspect));
+    const exportH = aspect >= 1 ? Math.max(1, Math.round(maxExportEdge / aspect)) : maxExportEdge;
+
     const outCanvas = document.createElement('canvas');
-    outCanvas.width = exportSize;
-    outCanvas.height = exportSize;
+    outCanvas.width = exportW;
+    outCanvas.height = exportH;
     const ctx = outCanvas.getContext('2d');
     if (!ctx) return;
 
     ctx.fillStyle = '#070b12';
-    ctx.fillRect(0, 0, exportSize, exportSize);
-    ctx.drawImage(baseCanvas, 0, 0, exportSize, exportSize);
+    ctx.fillRect(0, 0, exportW, exportH);
+    ctx.drawImage(baseCanvas, 0, 0, exportW, exportH);
 
     const triggerDownload = () => {
       const a = document.createElement('a');
@@ -762,7 +926,7 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
     const url = URL.createObjectURL(svgBlob);
     const img = new Image();
     img.onload = () => {
-      ctx.drawImage(img, 0, 0, exportSize, exportSize);
+      ctx.drawImage(img, 0, 0, exportW, exportH);
       URL.revokeObjectURL(url);
       triggerDownload();
     };
@@ -771,17 +935,17 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
       triggerDownload();
     };
     img.src = url;
-  }, [quarry?.name]);
+  }, [quarry?.name, canvasW, canvasH]);
 
-  // Compute active profile endpoints & samples (exact match to Visor 3D)
+  // Compute active profile endpoints & samples centered within the loaded plan
   const activeProfileSegment = useMemo(() => {
     if (profileMode === 'A') {
       return {
         label: "Perfil A–A' (Oeste–Este)",
         startTag: 'A',
         endTag: "A'",
-        p0: { x: terrain.defaultProfileA.x0, z: terrain.defaultProfileA.z0 },
-        p1: { x: terrain.defaultProfileA.x1, z: terrain.defaultProfileA.z1 },
+        p0: { x: -planSystem.halfSpanE * 0.82, z: 0 },
+        p1: { x: planSystem.halfSpanE * 0.82, z: 0 },
       };
     }
     if (profileMode === 'B') {
@@ -789,8 +953,8 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
         label: "Perfil B–B' (Norte–Sur)",
         startTag: 'B',
         endTag: "B'",
-        p0: { x: terrain.defaultProfileB.x0, z: terrain.defaultProfileB.z0 },
-        p1: { x: terrain.defaultProfileB.x1, z: terrain.defaultProfileB.z1 },
+        p0: { x: 0, z: -planSystem.halfSpanN * 0.82 },
+        p1: { x: 0, z: planSystem.halfSpanN * 0.82 },
       };
     }
     if (customPts.length === 2) {
@@ -809,10 +973,10 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
           : 'Haz 2 clics en el plano 2D para trazar el corte',
       startTag: 'A',
       endTag: "A'",
-      p0: { x: terrain.defaultProfileA.x0, z: terrain.defaultProfileA.z0 },
-      p1: { x: terrain.defaultProfileA.x1, z: terrain.defaultProfileA.z1 },
+      p0: { x: -planSystem.halfSpanE * 0.82, z: 0 },
+      p1: { x: planSystem.halfSpanE * 0.82, z: 0 },
     };
-  }, [profileMode, customPts, terrain]);
+  }, [profileMode, customPts, planSystem.halfSpanE, planSystem.halfSpanN]);
 
   const profileSamples = useMemo<ProfileSample[]>(() => {
     return sampleProfileLine(
@@ -930,13 +1094,45 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
       ? profileSamples[hoverSampleIdx]
       : null;
 
-  // Dynamic Graphic Scale Bar (50m / 100m)
-  const pxPerMeter = (BASE_CANVAS_PX / TERRAIN_SPAN_M) * zoom;
-  const scaleMeters = zoom >= 2.6 ? 50 : 100;
-  const scaleBarWidthPx = Math.min(220, Math.max(48, Math.round(scaleMeters * pxPerMeter)));
+  // Dynamic Graphic Scale Bar & Plan-Aligned Coordinate Grid
+  const pxPerMeter = (displayW / Math.max(0.01, planSystem.spanE)) * zoom;
+  const rawScaleMeters = 95 / Math.max(0.01, pxPerMeter);
+  const scaleCandidates = [5, 10, 20, 25, 50, 100, 200, 500, 1000];
+  const scaleMeters =
+    scaleCandidates.find((c) => c >= rawScaleMeters * 0.75) ??
+    scaleCandidates[scaleCandidates.length - 1];
+  const scaleBarWidthPx = Math.min(200, Math.max(44, Math.round(scaleMeters * pxPerMeter)));
 
-  const utmGridOffsets = [-150, -50, 50, 150];
-  const invScale = 1 / Math.max(0.85, Math.sqrt(zoom));
+  const utmGridLines = useMemo(() => {
+    const maxSpan = Math.max(planSystem.spanE, planSystem.spanN);
+    const steps = [10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000];
+    const step = steps.find((s) => maxSpan / s <= 5.5) ?? 5000;
+    const padE = planSystem.spanE * 0.04;
+    const padN = planSystem.spanN * 0.04;
+
+    const verticals: Array<{ val: number; px: number }> = [];
+    const startE = Math.ceil((planSystem.minE + padE) / step) * step;
+    for (let v = startE; v <= planSystem.maxE - padE; v += step) {
+      verticals.push({
+        val: v,
+        px: ((v - planSystem.minE) / planSystem.spanE) * canvasW,
+      });
+    }
+
+    const horizontals: Array<{ val: number; px: number }> = [];
+    const startN = Math.ceil((planSystem.minN + padN) / step) * step;
+    for (let v = startN; v <= planSystem.maxN - padN; v += step) {
+      horizontals.push({
+        val: v,
+        px: ((planSystem.maxN - v) / planSystem.spanN) * canvasH,
+      });
+    }
+
+    return { verticals, horizontals };
+  }, [planSystem, canvasW, canvasH]);
+
+  const svgLineStrokeScale = canvasW / Math.max(1, displayW);
+  const invScale = svgLineStrokeScale / Math.max(0.85, Math.sqrt(zoom));
 
   return (
     <div
@@ -972,11 +1168,11 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
             : 'cursor-grab active:cursor-grabbing'
         }`}
       >
-        {/* Panned & Zoomed 2D Orthophoto Canvas + Vector SVG Overlay */}
+        {/* Panned & Zoomed 2D Orthophoto Canvas + Vector SVG Overlay (aspect-locked & fitted) */}
         <div
           style={{
-            width: BASE_CANVAS_PX,
-            height: BASE_CANVAS_PX,
+            width: displayW,
+            height: displayH,
             position: 'absolute',
             left: '50%',
             top: '50%',
@@ -987,66 +1183,67 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
         >
           <canvas
             ref={orthoHostRef}
-            width={BASE_CANVAS_PX}
-            height={BASE_CANVAS_PX}
+            width={canvasW}
+            height={canvasH}
             className="block w-full h-full"
           />
 
           <svg
             ref={svgOverlayRef}
-            viewBox={`0 0 ${BASE_CANVAS_PX} ${BASE_CANVAS_PX}`}
+            viewBox={`0 0 ${canvasW} ${canvasH}`}
             className="absolute inset-0 w-full h-full pointer-events-none"
           >
-            {/* Vector UTM Coordinate Grid */}
-            {showUtmGrid &&
-              utmGridOffsets.map((offset) => {
-                const posPx = ((offset + TERRAIN_HALF_M) / TERRAIN_SPAN_M) * BASE_CANVAS_PX;
-                const utmH = terrain.worldToUtm(offset, 0);
-                const utmV = terrain.worldToUtm(0, offset);
-                return (
-                  <g key={offset}>
+            {/* Vector Plan/UTM Coordinate Grid */}
+            {showUtmGrid && (
+              <g>
+                {utmGridLines.verticals.map((v) => (
+                  <g key={`e-${v.val}`}>
                     <line
-                      x1={posPx}
+                      x1={v.px}
                       y1={0}
-                      x2={posPx}
-                      y2={BASE_CANVAS_PX}
+                      x2={v.px}
+                      y2={canvasH}
                       stroke="#38bdf8"
                       strokeOpacity={0.32}
-                      strokeWidth={1 / Math.max(1, zoom * 0.7)}
-                      strokeDasharray="6 6"
+                      strokeWidth={svgLineStrokeScale / Math.max(1, zoom * 0.7)}
+                      strokeDasharray={`${6 * svgLineStrokeScale} ${6 * svgLineStrokeScale}`}
                     />
                     <text
-                      x={posPx + 4}
-                      y={14}
+                      x={v.px + 4 * svgLineStrokeScale}
+                      y={14 * svgLineStrokeScale}
                       fill="#7dd3fc"
                       fontSize={10 * invScale}
                       fontFamily="monospace"
                     >
-                      E {formatEsInt(utmH.easting)}
-                    </text>
-
-                    <line
-                      x1={0}
-                      y1={posPx}
-                      x2={BASE_CANVAS_PX}
-                      y2={posPx}
-                      stroke="#38bdf8"
-                      strokeOpacity={0.32}
-                      strokeWidth={1 / Math.max(1, zoom * 0.7)}
-                      strokeDasharray="6 6"
-                    />
-                    <text
-                      x={6}
-                      y={posPx - 4}
-                      fill="#7dd3fc"
-                      fontSize={10 * invScale}
-                      fontFamily="monospace"
-                    >
-                      N {formatEsInt(utmV.northing)}
+                      E {formatEsInt(v.val)}
                     </text>
                   </g>
-                );
-              })}
+                ))}
+                {utmGridLines.horizontals.map((h) => (
+                  <g key={`n-${h.val}`}>
+                    <line
+                      x1={0}
+                      y1={h.px}
+                      x2={canvasW}
+                      y2={h.px}
+                      stroke="#38bdf8"
+                      strokeOpacity={0.32}
+                      strokeWidth={svgLineStrokeScale / Math.max(1, zoom * 0.7)}
+                      strokeDasharray={`${6 * svgLineStrokeScale} ${6 * svgLineStrokeScale}`}
+                    />
+                    <text
+                      x={6 * svgLineStrokeScale}
+                      y={h.px - 4 * svgLineStrokeScale}
+                      fill="#7dd3fc"
+                      fontSize={10 * invScale}
+                      fontFamily="monospace"
+                    >
+                      N {formatEsInt(h.val)}
+                    </text>
+                  </g>
+                ))}
+              </g>
+            )}
 
             {/* Vector Contour Lines */}
             {showContours &&
@@ -1522,7 +1719,7 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
                 <div className="text-[10px] font-mono text-gray-400 truncate">
                   {activeFlight
                     ? `${activeFlight.flightCode} · ${formatDateEu(activeFlight.surveyDate)}`
-                    : `ETRS89 / UTM 30N · 400×400 m`}
+                    : `${Math.round(planSystem.spanE)}×${Math.round(planSystem.spanN)} m`}
                 </div>
               </div>
             </div>
@@ -2163,7 +2360,7 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
                       {drawnPins.map((pin) => {
                         const isAnnotation = pin.kind === 'annotation';
                         const cotaZ = baseYToElevM(pin.point.baseY);
-                        const utm = terrain.worldToUtm(pin.point.x, pin.point.z);
+                        const utm = planWorldToCoords(pin.point.x, pin.point.z);
                         return (
                           <div
                             key={pin.id}
@@ -2741,7 +2938,7 @@ export const Quarry2DOrthophotoViewer: React.FC<Quarry2DOrthophotoViewerProps> =
           if (!activePin) return null;
           const isAnnotation = activePin.kind === 'annotation';
           const pinCotaZ = baseYToElevM(activePin.point.baseY);
-          const utm = terrain.worldToUtm(activePin.point.x, activePin.point.z);
+          const utm = planWorldToCoords(activePin.point.x, activePin.point.z);
           const updateActivePin = (patch: Partial<DrawnPin3D>) => {
             setDrawnPins((prev) =>
               prev.map((p) => (p.id === activePin.id ? { ...p, ...patch } : p))

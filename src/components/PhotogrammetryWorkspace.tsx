@@ -1,12 +1,31 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { Box, CheckCircle2, Eye, EyeOff, FileCode2, FolderUp, Image as ImageIcon, Map as MapIcon, Mountain, Plane, Upload } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  AlertCircle,
+  Box,
+  CheckCircle2,
+  Eye,
+  EyeOff,
+  FileCode2,
+  FolderUp,
+  Image as ImageIcon,
+  Loader2,
+  Map as MapIcon,
+  Mountain,
+  Plane,
+  RefreshCw,
+  Upload,
+} from 'lucide-react';
 import { Quarry3DViewer, type External3DSource } from './Quarry3DViewer.tsx';
 import { Quarry2DOrthophotoViewer } from './Quarry2DOrthophotoViewer.tsx';
 import { buildQuarryTerrainData } from '../utils/quarryTerrainModel.ts';
 import {
+  cadTransformToPlanBounds,
   isSupported3DFileName,
   isSupportedOrthoFileName,
-  loadOrthophotoCanvasFromUrl,
+  loadOrthophotoDataFromUrl,
+  type CadTransform,
+  type LoadedOrthophotoResult,
+  type PlanCoordinateBounds,
 } from '../utils/threeFileLoader.ts';
 import type { Deliverable, FlightDxfOverlay, Quarry, Stockpile, Survey, Zone } from '../types.ts';
 import { formatDateEu } from '../utils/dateUtils.ts';
@@ -34,6 +53,30 @@ function appendAuthToken(rawUrl: string): string {
   return `${rawUrl}${separator}token=${encodeURIComponent(token)}`;
 }
 
+function buildDeliverableAssetUrl(d: Deliverable): string {
+  if (d.shareUrl) return appendAuthToken(d.shareUrl);
+  const inlineUrl = d.fileUrl.includes('?') ? `${d.fileUrl}&inline=1` : `${d.fileUrl}?inline=1`;
+  return appendAuthToken(inlineUrl);
+}
+
+function hasAvailableUploadedFile(d: Deliverable): boolean {
+  return d.isServerStored ? Boolean(d.hasPhysicalFile) : Boolean(d.hasPhysicalFile || d.shareUrl);
+}
+
+function sortDeliverablesForContext(items: Deliverable[], activeFlightId?: number): Deliverable[] {
+  return [...items].sort((a, b) => {
+    const aMatchesFlight = activeFlightId ? Number(a.surveyId) === activeFlightId : false;
+    const bMatchesFlight = activeFlightId ? Number(b.surveyId) === activeFlightId : false;
+    if (aMatchesFlight !== bMatchesFlight) return aMatchesFlight ? -1 : 1;
+
+    const aDate = String(a.createdAt || a.uploadDate || '');
+    const bDate = String(b.createdAt || b.uploadDate || '');
+    if (aDate !== bDate) return bDate.localeCompare(aDate);
+
+    return Number(b.id) - Number(a.id);
+  });
+}
+
 export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = ({
   quarry,
   zones,
@@ -50,47 +93,66 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
   const [showDxfOverlay, setShowDxfOverlay] = useState<boolean>(true);
   const [dxfOpacity, setDxfOpacity] = useState<number>(0.48);
 
-  // Server deliverables strictly scoped to the single active quarry
+  // Server deliverables strictly scoped to the single active quarry & physically available
   const quarryScopedDeliverables = useMemo(() => {
     if (!quarry || quarry.id <= 0) return [];
-    return deliverables.filter((d) => d.quarryId === quarry.id);
+    return deliverables.filter((d) => d.quarryId === quarry.id && hasAvailableUploadedFile(d));
   }, [deliverables, quarry]);
 
-  // Server deliverables compatible with 3D Viewer & 2D Orthophoto
+  // Server deliverables compatible with 3D Viewer & 2D Orthophoto (active flight first, then newest)
   const compatible3DDeliverables = useMemo(
     () =>
-      quarryScopedDeliverables.filter(
-        (d) => (d.hasPhysicalFile || Boolean(d.shareUrl)) && isSupported3DFileName(d.fileName)
+      sortDeliverablesForContext(
+        quarryScopedDeliverables.filter((d) => isSupported3DFileName(d.fileName)),
+        activeFlight?.id
       ),
-    [quarryScopedDeliverables]
+    [quarryScopedDeliverables, activeFlight?.id]
   );
 
   const compatibleOrthoDeliverables = useMemo(
     () =>
-      quarryScopedDeliverables.filter(
-        (d) => (d.hasPhysicalFile || Boolean(d.shareUrl)) && isSupportedOrthoFileName(d.fileName)
+      sortDeliverablesForContext(
+        quarryScopedDeliverables.filter((d) => isSupportedOrthoFileName(d.fileName)),
+        activeFlight?.id
       ),
-    [quarryScopedDeliverables]
+    [quarryScopedDeliverables, activeFlight?.id]
   );
 
-  const [selected3DKey, setSelected3DKey] = useState<string>('parametric');
-  const [selectedOrthoKey, setSelectedOrthoKey] = useState<string>('parametric');
+  const [selected3DKey, setSelected3DKey] = useState<string>('');
+  const [selectedOrthoKey, setSelectedOrthoKey] = useState<string>('');
   const [local3DPreview, setLocal3DPreview] = useState<External3DSource | null>(null);
   const [localOrthoFile, setLocalOrthoFile] = useState<{ url: string; fileName: string } | null>(null);
-  const [customOrthoCanvas, setCustomOrthoCanvas] = useState<HTMLCanvasElement | null>(null);
+  const [loadedOrthophoto, setLoadedOrthophoto] = useState<LoadedOrthophotoResult | null>(null);
+  const [loaded3DCadTransform, setLoaded3DCadTransform] = useState<CadTransform | null>(null);
+  const [orthoLoading, setOrthoLoading] = useState<boolean>(false);
+  const [orthoError, setOrthoError] = useState<string | null>(null);
+  const [orthoReloadTick, setOrthoReloadTick] = useState<number>(0);
   const [localHintError, setLocalHintError] = useState<string | null>(null);
   const [localSuccessNotice, setLocalSuccessNotice] = useState<string | null>(null);
 
-  // Reset active model/orthophoto selection when switching to another quarry so only one model is shown
+  const lastFlightId3DRef = useRef<number | undefined>(activeFlight?.id);
+  const lastFlightIdOrthoRef = useRef<number | undefined>(activeFlight?.id);
+
+  // Reset local overrides and errors when switching to another quarry
   useEffect(() => {
-    setSelected3DKey('parametric');
-    setSelectedOrthoKey('parametric');
+    setSelected3DKey('');
+    setSelectedOrthoKey('');
     setLocal3DPreview(null);
     setLocalOrthoFile(null);
-    setCustomOrthoCanvas(null);
+    setLoadedOrthophoto(null);
+    setLoaded3DCadTransform(null);
+    setOrthoLoading(false);
+    setOrthoError(null);
     setLocalHintError(null);
     setLocalSuccessNotice(null);
+    lastFlightId3DRef.current = activeFlight?.id;
+    lastFlightIdOrthoRef.current = activeFlight?.id;
   }, [quarry?.id]);
+
+  // Clear stale 3D coordinate bounds whenever the selected 3D source changes
+  useEffect(() => {
+    setLoaded3DCadTransform(null);
+  }, [selected3DKey]);
 
   // Auto-select newly uploaded 3D or Orthophoto deliverable when uploaded from this workspace
   useEffect(() => {
@@ -105,6 +167,54 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
       setSelectedOrthoKey(`deliv:${dO.id}`);
     }
   }, [preferredDeliverableId, compatible3DDeliverables, compatibleOrthoDeliverables]);
+
+  // Automatically load the client's uploaded 3D model deliverable (prioritizing active flight)
+  useEffect(() => {
+    const flightChanged = lastFlightId3DRef.current !== activeFlight?.id;
+    lastFlightId3DRef.current = activeFlight?.id;
+
+    if (selected3DKey === 'local' && isAdmin && local3DPreview && !flightChanged) {
+      return;
+    }
+
+    if (compatible3DDeliverables.length === 0) {
+      if (!(selected3DKey === 'local' && isAdmin && local3DPreview)) {
+        setSelected3DKey('');
+      }
+      return;
+    }
+
+    const currentId = selected3DKey.startsWith('deliv:') ? Number(selected3DKey.slice(6)) : NaN;
+    const currentExists = Number.isFinite(currentId) && compatible3DDeliverables.some((d) => d.id === currentId);
+
+    if (!currentExists || flightChanged) {
+      setSelected3DKey(`deliv:${compatible3DDeliverables[0].id}`);
+    }
+  }, [compatible3DDeliverables, activeFlight?.id, selected3DKey, isAdmin, local3DPreview]);
+
+  // Automatically load the client's uploaded 2D orthophoto deliverable (prioritizing active flight)
+  useEffect(() => {
+    const flightChanged = lastFlightIdOrthoRef.current !== activeFlight?.id;
+    lastFlightIdOrthoRef.current = activeFlight?.id;
+
+    if (selectedOrthoKey === 'local' && isAdmin && localOrthoFile && !flightChanged) {
+      return;
+    }
+
+    if (compatibleOrthoDeliverables.length === 0) {
+      if (!(selectedOrthoKey === 'local' && isAdmin && localOrthoFile)) {
+        setSelectedOrthoKey('');
+      }
+      return;
+    }
+
+    const currentId = selectedOrthoKey.startsWith('deliv:') ? Number(selectedOrthoKey.slice(6)) : NaN;
+    const currentExists = Number.isFinite(currentId) && compatibleOrthoDeliverables.some((d) => d.id === currentId);
+
+    if (!currentExists || flightChanged) {
+      setSelectedOrthoKey(`deliv:${compatibleOrthoDeliverables[0].id}`);
+    }
+  }, [compatibleOrthoDeliverables, activeFlight?.id, selectedOrthoKey, isAdmin, localOrthoFile]);
 
   // Revoke object URLs on change/unmount
   useEffect(() => {
@@ -124,7 +234,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
   }, [localOrthoFile]);
 
   const activeExternal3DSource = useMemo<External3DSource | null>(() => {
-    if (selected3DKey === 'local' && local3DPreview) {
+    if (selected3DKey === 'local' && isAdmin && local3DPreview) {
       return local3DPreview;
     }
     if (selected3DKey.startsWith('deliv:')) {
@@ -132,67 +242,82 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
       const d = compatible3DDeliverables.find((item) => item.id === id);
       if (d) {
         return {
-          url: appendAuthToken(d.shareUrl || `${d.fileUrl}?inline=1`),
+          url: buildDeliverableAssetUrl(d),
           fileName: d.fileName,
           label: d.title || d.fileName,
         };
       }
     }
     return null;
-  }, [selected3DKey, local3DPreview, compatible3DDeliverables]);
+  }, [selected3DKey, isAdmin, local3DPreview, compatible3DDeliverables]);
 
-  // Load selected Orthophoto canvas when changed
+  const activeOrthoTarget = useMemo<{ url: string; fileName: string; label: string } | null>(() => {
+    if (selectedOrthoKey === 'local' && isAdmin && localOrthoFile) {
+      return {
+        url: localOrthoFile.url,
+        fileName: localOrthoFile.fileName,
+        label: `Local: ${localOrthoFile.fileName}`,
+      };
+    }
+    if (selectedOrthoKey.startsWith('deliv:')) {
+      const id = Number(selectedOrthoKey.slice(6));
+      const d = compatibleOrthoDeliverables.find((item) => item.id === id);
+      if (d) {
+        return {
+          url: buildDeliverableAssetUrl(d),
+          fileName: d.fileName,
+          label: d.title || d.fileName,
+        };
+      }
+    }
+    return null;
+  }, [selectedOrthoKey, isAdmin, localOrthoFile, compatibleOrthoDeliverables]);
+
+  // Load selected Orthophoto canvas & GeoTIFF bounds automatically when target changes
   useEffect(() => {
     let cancelled = false;
 
-    const resolveUrlAndName = (): { url: string; fileName: string } | null => {
-      if (selectedOrthoKey === 'local' && localOrthoFile) {
-        return localOrthoFile;
-      }
-      if (selectedOrthoKey.startsWith('deliv:')) {
-        const id = Number(selectedOrthoKey.slice(6));
-        const d = compatibleOrthoDeliverables.find((item) => item.id === id);
-        if (d) {
-          return {
-            url: appendAuthToken(d.shareUrl || `${d.fileUrl}?inline=1`),
-            fileName: d.fileName,
-          };
-        }
-      }
-      return null;
-    };
-
-    const target = resolveUrlAndName();
-    if (!target) {
-      setCustomOrthoCanvas(null);
+    if (!activeOrthoTarget) {
+      setLoadedOrthophoto(null);
+      setOrthoLoading(false);
+      setOrthoError(null);
       return;
     }
 
-    loadOrthophotoCanvasFromUrl(target.url, target.fileName)
-      .then((canvas) => {
+    setOrthoLoading(true);
+    setOrthoError(null);
+    setLoadedOrthophoto(null);
+
+    loadOrthophotoDataFromUrl(activeOrthoTarget.url, activeOrthoTarget.fileName)
+      .then((result) => {
         if (!cancelled) {
-          setCustomOrthoCanvas(canvas);
+          setLoadedOrthophoto(result);
+          setOrthoLoading(false);
+          setOrthoError(null);
           setLocalHintError(null);
         }
       })
       .catch((err: unknown) => {
         if (!cancelled) {
-          setCustomOrthoCanvas(null);
-          setLocalHintError(err instanceof Error ? err.message : 'No se pudo cargar la ortofoto.');
+          const message = err instanceof Error ? err.message : 'No se pudo cargar la ortofoto.';
+          setLoadedOrthophoto(null);
+          setOrthoLoading(false);
+          setOrthoError(message);
+          setLocalHintError(message);
         }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [selectedOrthoKey, localOrthoFile, compatibleOrthoDeliverables]);
+  }, [activeOrthoTarget, orthoReloadTick]);
 
   useEffect(() => {
     if (isAdmin) return;
     setLocal3DPreview(null);
     setLocalOrthoFile(null);
-    setSelected3DKey((k) => (k === 'local' ? 'parametric' : k));
-    setSelectedOrthoKey((k) => (k === 'local' ? 'parametric' : k));
+    setSelected3DKey((k) => (k === 'local' ? '' : k));
+    setSelectedOrthoKey((k) => (k === 'local' ? '' : k));
   }, [isAdmin]);
 
   const handleLocalPreviewFile = (file: File | null) => {
@@ -225,6 +350,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
       const url = URL.createObjectURL(file);
       setLocalOrthoFile({ url, fileName: file.name });
       setSelectedOrthoKey('local');
+      setViewerMode('2d');
       setLocalSuccessNotice(`Ortofoto cargada correctamente en el visor: ${file.name}`);
       return;
     }
@@ -248,6 +374,36 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     [quarry, zones, scopedStockpiles]
   );
 
+  const resolved2DPlanBounds = useMemo<PlanCoordinateBounds | null>(() => {
+    if (loadedOrthophoto?.geoBounds) {
+      return loadedOrthophoto.geoBounds;
+    }
+    if (
+      dxfOverlay?.bounds &&
+      Number.isFinite(dxfOverlay.bounds.minX) &&
+      Number.isFinite(dxfOverlay.bounds.maxX) &&
+      Number.isFinite(dxfOverlay.bounds.minY) &&
+      Number.isFinite(dxfOverlay.bounds.maxY) &&
+      dxfOverlay.bounds.maxX > dxfOverlay.bounds.minX &&
+      dxfOverlay.bounds.maxY > dxfOverlay.bounds.minY
+    ) {
+      return {
+        minE: dxfOverlay.bounds.minX,
+        maxE: dxfOverlay.bounds.maxX,
+        minN: dxfOverlay.bounds.minY,
+        maxN: dxfOverlay.bounds.maxY,
+        source: 'dxf',
+      };
+    }
+    if (loaded3DCadTransform) {
+      return cadTransformToPlanBounds(loaded3DCadTransform);
+    }
+    return null;
+  }, [loadedOrthophoto, dxfOverlay, loaded3DCadTransform]);
+
+  const hasAny3DSource = Boolean(activeExternal3DSource);
+  const hasAnyOrthoSource = Boolean(activeOrthoTarget);
+
   return (
     <section className="flex-1 flex flex-col gap-4 min-h-0">
       {/* Header & Workspace Switcher */}
@@ -267,7 +423,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
                 )}
               </h2>
               <p className="text-xs text-gray-400">
-                {quarry?.name || 'Explotación Activa'} · Cota Z automática
+                {quarry?.name || 'Explotación Activa'} · Carga automática de modelos del cliente
               </p>
             </div>
           </div>
@@ -298,86 +454,97 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
           </div>
         </div>
 
-        {/* Source Selector & Upload Bar */}
-        <div className="pt-3 border-t border-gray-800 flex flex-wrap items-center justify-between gap-2.5 text-xs">
-          <div className="flex flex-wrap items-center gap-2.5">
-            <label className="inline-flex items-center gap-1.5 text-gray-300">
-              <Box className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-              <span className="font-semibold">Modelo 3D:</span>
-              <select
-                value={selected3DKey}
-                onChange={(e) => setSelected3DKey(e.target.value)}
-                className="bg-[#0b0f17] border border-gray-700 rounded-lg px-2.5 py-1 text-xs text-white cursor-pointer max-w-[240px]"
-              >
-                <option value="parametric">MDE Calculado del Vuelo (Automático)</option>
-                {compatible3DDeliverables.map((d) => (
-                  <option key={d.id} value={`deliv:${d.id}`}>
-                    {d.title || d.fileName} ({d.fileName})
-                  </option>
-                ))}
-                {isAdmin && local3DPreview && (
-                  <option value="local">{local3DPreview.label}</option>
-                )}
-              </select>
-            </label>
+        {/* Source Selector & Upload Bar (Admin only) */}
+        {isAdmin && (
+          <div className="pt-3 border-t border-gray-800 flex flex-wrap items-center justify-between gap-2.5 text-xs">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <label className="inline-flex items-center gap-1.5 text-gray-300">
+                <Box className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                <span className="font-semibold">Modelo 3D:</span>
+                <select
+                  value={selected3DKey}
+                  onChange={(e) => setSelected3DKey(e.target.value)}
+                  disabled={compatible3DDeliverables.length === 0 && !local3DPreview}
+                  className="bg-[#0b0f17] border border-gray-700 rounded-lg px-2.5 py-1 text-xs text-white cursor-pointer max-w-[260px] disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {compatible3DDeliverables.length === 0 && !local3DPreview ? (
+                    <option value="">Sin modelo 3D subido</option>
+                  ) : (
+                    <>
+                      {compatible3DDeliverables.map((d) => (
+                        <option key={d.id} value={`deliv:${d.id}`}>
+                          {d.title || d.fileName} ({d.fileName})
+                        </option>
+                      ))}
+                      {local3DPreview && (
+                        <option value="local">{local3DPreview.label}</option>
+                      )}
+                    </>
+                  )}
+                </select>
+              </label>
 
-            <label className="inline-flex items-center gap-1.5 text-gray-300">
-              <ImageIcon className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-              <span className="font-semibold">Ortofoto:</span>
-              <select
-                value={selectedOrthoKey}
-                onChange={(e) => setSelectedOrthoKey(e.target.value)}
-                className="bg-[#0b0f17] border border-gray-700 rounded-lg px-2.5 py-1 text-xs text-white cursor-pointer max-w-[220px]"
-              >
-                <option value="parametric">Ortofoto Base Generada</option>
-                {compatibleOrthoDeliverables.map((d) => (
-                  <option key={d.id} value={`deliv:${d.id}`}>
-                    {d.title || d.fileName} ({d.fileName})
-                  </option>
-                ))}
-                {isAdmin && localOrthoFile && (
-                  <option value="local">Local: {localOrthoFile.fileName}</option>
-                )}
-              </select>
-            </label>
+              <label className="inline-flex items-center gap-1.5 text-gray-300">
+                <ImageIcon className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span className="font-semibold">Ortofoto:</span>
+                <select
+                  value={selectedOrthoKey}
+                  onChange={(e) => setSelectedOrthoKey(e.target.value)}
+                  disabled={compatibleOrthoDeliverables.length === 0 && !localOrthoFile}
+                  className="bg-[#0b0f17] border border-gray-700 rounded-lg px-2.5 py-1 text-xs text-white cursor-pointer max-w-[240px] disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {compatibleOrthoDeliverables.length === 0 && !localOrthoFile ? (
+                    <option value="">Sin ortofoto subida</option>
+                  ) : (
+                    <>
+                      {compatibleOrthoDeliverables.map((d) => (
+                        <option key={d.id} value={`deliv:${d.id}`}>
+                          {d.title || d.fileName} ({d.fileName})
+                        </option>
+                      ))}
+                      {localOrthoFile && (
+                        <option value="local">Local: {localOrthoFile.fileName}</option>
+                      )}
+                    </>
+                  )}
+                </select>
+              </label>
 
-            {dxfOverlay ? (
-              <button
-                type="button"
-                onClick={() => setShowDxfOverlay((v) => !v)}
-                className={`px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 border transition cursor-pointer ${
-                  showDxfOverlay
-                    ? 'bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 border-cyan-500/45'
-                    : 'bg-[#0b0f17] hover:bg-gray-800 text-gray-400 hover:text-white border-gray-700'
-                }`}
-                title={`Superponer polígonos DXF 3D (${dxfOverlay.fileName}) sobre modelos 3D/2D`}
-                aria-pressed={showDxfOverlay}
-              >
-                <FileCode2 className={`w-3.5 h-3.5 ${showDxfOverlay ? 'text-cyan-400' : 'text-gray-500'}`} />
-                <span>DXF 3D ({dxfOverlay.polygons.filter((p) => p.visible !== false).length})</span>
-                {showDxfOverlay ? (
-                  <Eye className="w-3.5 h-3.5 text-cyan-300" />
-                ) : (
-                  <EyeOff className="w-3.5 h-3.5 text-gray-500" />
-                )}
-              </button>
-            ) : (
-              isAdmin &&
-              onOpenDxfSettings && (
+              {dxfOverlay ? (
                 <button
                   type="button"
-                  onClick={onOpenDxfSettings}
-                  className="px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 border border-dashed border-cyan-500/40 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-200 transition cursor-pointer"
-                  title="Ir a Configuración → Perímetros DXF 3D para subir el DXF de este vuelo"
+                  onClick={() => setShowDxfOverlay((v) => !v)}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 border transition cursor-pointer ${
+                    showDxfOverlay
+                      ? 'bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-200 border-cyan-500/45'
+                      : 'bg-[#0b0f17] hover:bg-gray-800 text-gray-400 hover:text-white border-gray-700'
+                  }`}
+                  title={`Superponer polígonos DXF 3D (${dxfOverlay.fileName}) sobre modelos 3D/2D`}
+                  aria-pressed={showDxfOverlay}
                 >
-                  <FileCode2 className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Asignar DXF 3D del vuelo</span>
+                  <FileCode2 className={`w-3.5 h-3.5 ${showDxfOverlay ? 'text-cyan-400' : 'text-gray-500'}`} />
+                  <span>DXF 3D ({dxfOverlay.polygons.filter((p) => p.visible !== false).length})</span>
+                  {showDxfOverlay ? (
+                    <Eye className="w-3.5 h-3.5 text-cyan-300" />
+                  ) : (
+                    <EyeOff className="w-3.5 h-3.5 text-gray-500" />
+                  )}
                 </button>
-              )
-            )}
-          </div>
+              ) : (
+                onOpenDxfSettings && (
+                  <button
+                    type="button"
+                    onClick={onOpenDxfSettings}
+                    className="px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 border border-dashed border-cyan-500/40 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-200 transition cursor-pointer"
+                    title="Ir a Configuración → Perímetros DXF 3D para subir el DXF de este vuelo"
+                  >
+                    <FileCode2 className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>Asignar DXF 3D del vuelo</span>
+                  </button>
+                )
+              )}
+            </div>
 
-          {isAdmin && (
             <div className="flex flex-wrap items-center gap-2">
               <label
                 className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 font-semibold inline-flex items-center gap-1.5 cursor-pointer transition"
@@ -409,8 +576,8 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
                 </button>
               )}
             </div>
-          )}
-        </div>
+          </div>
+        )}
 
         {localSuccessNotice && (
           <div className="bg-emerald-500/15 border border-emerald-500/40 text-emerald-200 rounded-xl px-3 py-2 text-xs flex items-center justify-between gap-2">
@@ -435,30 +602,147 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
         )}
       </div>
 
-      {/* Active Viewer (strictly single quarry model) */}
+      {/* Active Viewer (strictly single quarry uploaded models) */}
       {viewerMode === '3d' ? (
-        <Quarry3DViewer
-          key={quarry?.id ?? 'single-quarry'}
-          quarry={quarry}
-          activeFlight={activeFlight}
-          terrain={terrain}
-          external3DSource={activeExternal3DSource}
-          customOrthoCanvas={customOrthoCanvas}
-          onClearExternal3D={() => setSelected3DKey('parametric')}
-          dxfOverlay={dxfOverlay}
-          dxfStockpiles={scopedStockpiles}
-          showDxfOverlay={showDxfOverlay}
-          onToggleDxfOverlay={() => setShowDxfOverlay((v) => !v)}
-          dxfOpacity={dxfOpacity}
-          onChangeDxfOpacity={setDxfOpacity}
-        />
+        hasAny3DSource ? (
+          <Quarry3DViewer
+            key={quarry?.id ?? 'single-quarry'}
+            quarry={quarry}
+            activeFlight={activeFlight}
+            terrain={terrain}
+            external3DSource={activeExternal3DSource}
+            customOrthoCanvas={loadedOrthophoto?.canvas ?? null}
+            onModelBoundsChange={setLoaded3DCadTransform}
+            dxfOverlay={dxfOverlay}
+            dxfStockpiles={scopedStockpiles}
+            showDxfOverlay={showDxfOverlay}
+            onToggleDxfOverlay={() => setShowDxfOverlay((v) => !v)}
+            dxfOpacity={dxfOpacity}
+            onChangeDxfOpacity={setDxfOpacity}
+          />
+        ) : (
+          <div className="glass-panel border border-gray-800 rounded-2xl flex-1 min-h-[540px] flex items-center justify-center p-6 bg-[#090d16]">
+            <div className="max-w-md w-full text-center space-y-4 bg-[#0f1623] border border-gray-800 rounded-2xl p-6 sm:p-8 shadow-xl">
+              <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-300 flex items-center justify-center">
+                <Box className="w-7 h-7" />
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-base sm:text-lg font-bold text-white">
+                  No hay archivo 3D para visualizar
+                </h3>
+                <p className="text-xs sm:text-sm text-gray-300 leading-relaxed">
+                  {isAdmin
+                    ? 'No hay ningún modelo 3D subido para este cliente o vuelo. Sube un archivo (.OBJ, .GLB, .PLY, .STL, .LAS, .XYZ, .PCD) para que el cliente pueda visualizarlo.'
+                    : 'No hay ningún archivo de modelo 3D disponible para visualizar en este momento. Por favor, ponte en contacto con el administrador para que suba los archivos del modelo.'}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center justify-center gap-2.5 pt-2">
+                {compatibleOrthoDeliverables.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setViewerMode('2d')}
+                    className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 shadow cursor-pointer transition"
+                  >
+                    <MapIcon className="w-3.5 h-3.5" />
+                    <span>Ver Ortofoto en Planos 2D</span>
+                  </button>
+                )}
+                {isAdmin && onOpenUploadModal && (
+                  <button
+                    type="button"
+                    onClick={onOpenUploadModal}
+                    className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 shadow cursor-pointer transition"
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>Subir Modelo 3D al Cliente</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )
+      ) : !hasAnyOrthoSource ? (
+        <div className="glass-panel border border-gray-800 rounded-2xl flex-1 min-h-[540px] flex items-center justify-center p-6 bg-[#090d16]">
+          <div className="max-w-md w-full text-center space-y-4 bg-[#0f1623] border border-gray-800 rounded-2xl p-6 sm:p-8 shadow-xl">
+            <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-300 flex items-center justify-center">
+              <ImageIcon className="w-7 h-7" />
+            </div>
+            <div className="space-y-2">
+              <h3 className="text-base sm:text-lg font-bold text-white">
+                No hay ortofoto ni plano 2D para visualizar
+              </h3>
+              <p className="text-xs sm:text-sm text-gray-300 leading-relaxed">
+                {isAdmin
+                  ? 'No hay ninguna ortofoto o plano 2D subido para este cliente o vuelo. Sube una imagen (.TIF, .PNG, .JPG, .WEBP) para que el cliente pueda visualizarla.'
+                  : 'No hay ningún archivo de ortofoto o plano 2D disponible para visualizar en este momento. Por favor, ponte en contacto con el administrador para que suba los archivos del vuelo.'}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center justify-center gap-2.5 pt-2">
+              {compatible3DDeliverables.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setViewerMode('3d')}
+                  className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 shadow cursor-pointer transition"
+                >
+                  <Box className="w-3.5 h-3.5" />
+                  <span>Ver Modelo en Visor 3D</span>
+                </button>
+              )}
+              {isAdmin && onOpenUploadModal && (
+                <button
+                  type="button"
+                  onClick={onOpenUploadModal}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 shadow cursor-pointer transition"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Subir Ortofoto al Cliente</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : orthoLoading ? (
+        <div className="glass-panel border border-gray-800 rounded-2xl flex-1 min-h-[540px] flex items-center justify-center p-6 bg-[#090d16]">
+          <div className="text-center space-y-3 p-6 rounded-2xl border border-cyan-500/35 bg-[#0f1623] max-w-sm shadow-xl">
+            <Loader2 className="w-8 h-8 text-cyan-400 animate-spin mx-auto" />
+            <p className="text-sm font-bold text-cyan-300">Cargando ortofoto del cliente...</p>
+            <p className="text-xs text-gray-400 break-all">{activeOrthoTarget?.fileName}</p>
+          </div>
+        </div>
+      ) : orthoError || !loadedOrthophoto ? (
+        <div className="glass-panel border border-gray-800 rounded-2xl flex-1 min-h-[540px] flex items-center justify-center p-6 bg-[#090d16]">
+          <div className="max-w-md w-full text-center space-y-4 bg-[#0f1623] border border-red-500/40 rounded-2xl p-6 shadow-xl">
+            <div className="w-12 h-12 mx-auto rounded-xl bg-red-500/15 border border-red-500/30 text-red-300 flex items-center justify-center">
+              <AlertCircle className="w-6 h-6" />
+            </div>
+            <div className="space-y-1.5">
+              <h3 className="text-base font-bold text-red-300">No se pudo cargar la ortofoto</h3>
+              <p className="text-xs text-gray-300 leading-relaxed">
+                {orthoError || 'El archivo de ortofoto no se pudo procesar. Ponte en contacto con el administrador.'}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setOrthoReloadTick((t) => t + 1)}
+              className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer transition"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Reintentar carga</span>
+            </button>
+          </div>
+        </div>
       ) : (
         <Quarry2DOrthophotoViewer
           key={quarry?.id ?? 'single-quarry'}
           quarry={quarry}
           activeFlight={activeFlight}
           terrain={terrain}
-          customOrthoCanvas={customOrthoCanvas}
+          customOrthoCanvas={loadedOrthophoto.canvas}
+          orthoNaturalSize={{
+            width: loadedOrthophoto.naturalWidth,
+            height: loadedOrthophoto.naturalHeight,
+          }}
+          planBounds={resolved2DPlanBounds}
           dxfOverlay={dxfOverlay}
           dxfStockpiles={scopedStockpiles}
           showDxfOverlay={showDxfOverlay}

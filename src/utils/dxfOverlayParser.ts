@@ -783,6 +783,14 @@ export interface DxfWorldMappingOptions {
   externalHeightSpan?: number;
   viewerZMinM?: number;
   viewerZMaxM?: number;
+  planWorldBounds?: {
+    minE: number;
+    maxE: number;
+    minN: number;
+    maxN: number;
+    spanE: number;
+    spanN: number;
+  } | null;
 }
 
 export interface DxfWorldMapper {
@@ -800,6 +808,35 @@ export function createDxfWorldMapper(
   const spanZ = Math.max(0.01, bounds.maxZ - bounds.minZ);
   const cx = (bounds.minX + bounds.maxX) * 0.5;
   const cy = (bounds.minY + bounds.maxY) * 0.5;
+
+  // 0. Map directly onto loaded 2D plan coordinate bounds when provided
+  if (opts.planWorldBounds) {
+    const pb = opts.planWorldBounds;
+    const pbSpanE = Math.max(1e-4, pb.maxE - pb.minE);
+    const pbSpanN = Math.max(1e-4, pb.maxN - pb.minN);
+    const pbCenterE = (pb.minE + pb.maxE) * 0.5;
+    const pbCenterN = (pb.minN + pb.maxN) * 0.5;
+    const marginE = Math.max(50, pbSpanE * 0.35);
+    const marginN = Math.max(50, pbSpanN * 0.35);
+    const overlapsPlan =
+      bounds.maxX >= pb.minE - marginE &&
+      bounds.minX <= pb.maxE + marginE &&
+      bounds.maxY >= pb.minN - marginN &&
+      bounds.minY <= pb.maxN + marginN;
+
+    if (overlapsPlan) {
+      const zMin = opts.demElevMinM;
+      const zSpan = Math.max(0.01, opts.demElevMaxM - opts.demElevMinM);
+      return {
+        mode: 'utm_exact',
+        mapPoint: (pt: DxfPoint3D) => ({
+          worldX: ((pt.x - pbCenterE) / pbSpanE) * pb.spanE,
+          baseY: ((pt.z - zMin) / zSpan) * 40,
+          worldZ: -((pt.y - pbCenterN) / pbSpanN) * pb.spanN,
+        }),
+      };
+    }
+  }
 
   // 1. Align directly to loaded External 3D model when CAD bounds overlap
   if (opts.hasExternal3D && opts.cadTransform) {
