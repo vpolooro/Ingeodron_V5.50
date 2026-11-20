@@ -24,6 +24,7 @@ import {
   isSupported3DFileName,
   isSupportedOrthoFileName,
   loadOrthophotoDataFromUrl,
+  parseWorldFileBounds,
   type CadTransform,
   type LoadedOrthophotoResult,
   type PlanCoordinateBounds,
@@ -116,14 +117,34 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     [quarryScopedDeliverables, activeFlight?.id]
   );
 
-  const compatibleOrthoDeliverables = useMemo(
-    () =>
-      sortDeliverablesForContext(
-        quarryScopedDeliverables.filter((d) => isSupportedOrthoFileName(d.fileName)),
-        activeFlight?.id
-      ),
-    [quarryScopedDeliverables, activeFlight?.id]
-  );
+  const compatibleOrthoDeliverables = useMemo(() => {
+    const orthoCandidates = quarryScopedDeliverables.filter((d) =>
+      isSupportedOrthoFileName(d.fileName)
+    );
+    const baseSorted = sortDeliverablesForContext(orthoCandidates, activeFlight?.id);
+    const isTiff = (name: string) => {
+      const lower = name.toLowerCase();
+      return lower.endsWith('.tif') || lower.endsWith('.tiff');
+    };
+    const isOrthoCategory = (cat?: string) =>
+      cat === 'orthophoto' || cat === 'gis_geotiff';
+
+    return [...baseSorted].sort((a, b) => {
+      const aMatchesFlight = activeFlight?.id ? Number(a.surveyId) === activeFlight.id : false;
+      const bMatchesFlight = activeFlight?.id ? Number(b.surveyId) === activeFlight.id : false;
+      if (aMatchesFlight !== bMatchesFlight) return aMatchesFlight ? -1 : 1;
+
+      const aIsOrtho = isOrthoCategory(a.category);
+      const bIsOrtho = isOrthoCategory(b.category);
+      if (aIsOrtho !== bIsOrtho) return aIsOrtho ? -1 : 1;
+
+      const aIsTiff = isTiff(a.fileName);
+      const bIsTiff = isTiff(b.fileName);
+      if (aIsTiff !== bIsTiff) return aIsTiff ? -1 : 1;
+
+      return 0;
+    });
+  }, [quarryScopedDeliverables, activeFlight?.id]);
 
   const compatibleContourDxfDeliverables = useMemo(
     () =>
@@ -316,15 +337,36 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
       const id = Number(selected3DKey.slice(6));
       const d = compatible3DDeliverables.find((item) => item.id === id);
       if (d) {
+        const companionExts = ['.mtl', '.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff', '.bin'];
+        const companionAssets = sortDeliverablesForContext(
+          quarryScopedDeliverables.filter((item) => {
+            if (item.id === d.id) return false;
+            const lower = item.fileName.toLowerCase();
+            return companionExts.some((ext) => lower.endsWith(ext));
+          }),
+          activeFlight?.id
+        ).map((item) => ({
+          fileName: item.fileName,
+          url: buildDeliverableAssetUrl(item),
+        }));
+
         return {
           url: buildDeliverableAssetUrl(d),
           fileName: d.fileName,
           label: d.title || d.fileName,
+          companionAssets,
         };
       }
     }
     return null;
-  }, [selected3DKey, isAdmin, local3DPreview, compatible3DDeliverables]);
+  }, [
+    selected3DKey,
+    isAdmin,
+    local3DPreview,
+    compatible3DDeliverables,
+    quarryScopedDeliverables,
+    activeFlight?.id,
+  ]);
 
   const activeOrthoTarget = useMemo<{ url: string; fileName: string; label: string } | null>(() => {
     if (selectedOrthoKey === 'local' && isAdmin && localOrthoFile) {
@@ -370,7 +412,55 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     return null;
   }, [selectedContourDxfKey, isAdmin, localContourDxfFile, compatibleContourDxfDeliverables]);
 
-  // Load selected Orthophoto canvas & GeoTIFF bounds automatically when target changes
+  const matchingWorldFileTarget = useMemo<{ url: string; fileName: string } | null>(() => {
+    if (!activeOrthoTarget) return null;
+    const stripExt = (name: string) => {
+      const clean = name.split('?')[0].toLowerCase().trim();
+      const dot = clean.lastIndexOf('.');
+      return dot >= 0 ? clean.slice(0, dot) : clean;
+    };
+    const getExt = (name: string) => {
+      const clean = name.split('?')[0].toLowerCase().trim();
+      const dot = clean.lastIndexOf('.');
+      return dot >= 0 ? clean.slice(dot) : '';
+    };
+    const worldExts = new Set(['.tfw', '.tfwx', '.jgw', '.jgwx', '.pgw', '.pgwx', '.wld']);
+    const orthoBase = stripExt(activeOrthoTarget.fileName);
+    const orthoExt = getExt(activeOrthoTarget.fileName);
+    const preferredExt =
+      orthoExt === '.tif' || orthoExt === '.tiff'
+        ? '.tfw'
+        : orthoExt === '.jpg' || orthoExt === '.jpeg'
+        ? '.jgw'
+        : orthoExt === '.png'
+        ? '.pgw'
+        : '.wld';
+
+    const worldDeliverables = sortDeliverablesForContext(
+      quarryScopedDeliverables.filter((d) => worldExts.has(getExt(d.fileName))),
+      activeFlight?.id
+    );
+    if (worldDeliverables.length === 0) return null;
+
+    const exactMatch = worldDeliverables.find((d) => stripExt(d.fileName) === orthoBase);
+    if (exactMatch) {
+      return { url: buildDeliverableAssetUrl(exactMatch), fileName: exactMatch.fileName };
+    }
+
+    const flightWorld = activeFlight
+      ? worldDeliverables.find(
+          (d) =>
+            Number(d.surveyId) === activeFlight.id &&
+            (getExt(d.fileName) === preferredExt || getExt(d.fileName) === '.wld')
+        )
+      : undefined;
+    if (flightWorld) {
+      return { url: buildDeliverableAssetUrl(flightWorld), fileName: flightWorld.fileName };
+    }
+    return null;
+  }, [activeOrthoTarget, quarryScopedDeliverables, activeFlight]);
+
+  // Load selected Orthophoto canvas & GeoTIFF / world-file bounds automatically when target changes
   useEffect(() => {
     let cancelled = false;
 
@@ -386,9 +476,29 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     setLoadedOrthophoto(null);
 
     loadOrthophotoDataFromUrl(activeOrthoTarget.url, activeOrthoTarget.fileName)
-      .then((result) => {
+      .then(async (result) => {
+        if (cancelled) return;
+        let resolvedResult = result;
+        if (!result.geoBounds && matchingWorldFileTarget) {
+          try {
+            const wfResp = await fetch(matchingWorldFileTarget.url);
+            if (wfResp.ok) {
+              const wfText = await wfResp.text();
+              const wfBounds = parseWorldFileBounds(
+                wfText,
+                result.naturalWidth,
+                result.naturalHeight
+              );
+              if (wfBounds) {
+                resolvedResult = { ...result, geoBounds: wfBounds };
+              }
+            }
+          } catch {
+            // Optional world-file lookup failure should not block orthophoto rendering
+          }
+        }
         if (!cancelled) {
-          setLoadedOrthophoto(result);
+          setLoadedOrthophoto(resolvedResult);
           setOrthoLoading(false);
           setOrthoError(null);
           setLocalHintError(null);
@@ -407,7 +517,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
     return () => {
       cancelled = true;
     };
-  }, [activeOrthoTarget, orthoReloadTick]);
+  }, [activeOrthoTarget, matchingWorldFileTarget, orthoReloadTick]);
 
   // Load & parse uploaded Contour DXF automatically for BOTH 3D and 2D viewers
   useEffect(() => {
@@ -511,8 +621,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
       const url = URL.createObjectURL(file);
       setLocalOrthoFile({ url, fileName: file.name });
       setSelectedOrthoKey('local');
-      setViewerMode('2d');
-      setLocalSuccessNotice(`Ortofoto cargada correctamente en el visor: ${file.name}`);
+      setLocalSuccessNotice(`Ortofoto cargada correctamente en los visores (3D y 2D): ${file.name}`);
       return;
     }
 
@@ -536,36 +645,78 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
   );
 
   const resolved2DPlanBounds = useMemo<PlanCoordinateBounds | null>(() => {
+    // 1. Exact raster georeferencing (embedded GeoTIFF tags or sidecar world file)
     if (loadedOrthophoto?.geoBounds) {
       return loadedOrthophoto.geoBounds;
     }
-    if (
+
+    // 2. Full quarry 3D model footprint when orthophoto has no embedded GeoTIFF/world-file bounds
+    const model3DBounds = loaded3DCadTransform
+      ? cadTransformToPlanBounds(loaded3DCadTransform)
+      : null;
+    if (model3DBounds) {
+      return model3DBounds;
+    }
+
+    // 3. Combine contour DXF & stockpile DXF bounds when both share coordinate space
+    const contourBounds = loadedContourDxf?.planBounds ?? null;
+    const hasValidOverlayBounds = Boolean(
       dxfOverlay?.bounds &&
-      Number.isFinite(dxfOverlay.bounds.minX) &&
-      Number.isFinite(dxfOverlay.bounds.maxX) &&
-      Number.isFinite(dxfOverlay.bounds.minY) &&
-      Number.isFinite(dxfOverlay.bounds.maxY) &&
-      dxfOverlay.bounds.maxX > dxfOverlay.bounds.minX &&
-      dxfOverlay.bounds.maxY > dxfOverlay.bounds.minY
-    ) {
-      return {
-        minE: dxfOverlay.bounds.minX,
-        maxE: dxfOverlay.bounds.maxX,
-        minN: dxfOverlay.bounds.minY,
-        maxN: dxfOverlay.bounds.maxY,
-        source: 'dxf',
-      };
+        Number.isFinite(dxfOverlay.bounds.minX) &&
+        Number.isFinite(dxfOverlay.bounds.maxX) &&
+        Number.isFinite(dxfOverlay.bounds.minY) &&
+        Number.isFinite(dxfOverlay.bounds.maxY) &&
+        dxfOverlay.bounds.maxX > dxfOverlay.bounds.minX &&
+        dxfOverlay.bounds.maxY > dxfOverlay.bounds.minY
+    );
+    const overlayBounds: PlanCoordinateBounds | null =
+      hasValidOverlayBounds && dxfOverlay
+        ? {
+            minE: dxfOverlay.bounds.minX,
+            maxE: dxfOverlay.bounds.maxX,
+            minN: dxfOverlay.bounds.minY,
+            maxN: dxfOverlay.bounds.maxY,
+            source: 'dxf',
+          }
+        : null;
+
+    if (contourBounds && overlayBounds) {
+      const cSpanE = Math.max(1e-3, contourBounds.maxE - contourBounds.minE);
+      const cSpanN = Math.max(1e-3, contourBounds.maxN - contourBounds.minN);
+      const oSpanE = Math.max(1e-3, overlayBounds.maxE - overlayBounds.minE);
+      const oSpanN = Math.max(1e-3, overlayBounds.maxN - overlayBounds.minN);
+      const marginE = Math.max(150, Math.max(cSpanE, oSpanE) * 0.75);
+      const marginN = Math.max(150, Math.max(cSpanN, oSpanN) * 0.75);
+      const overlaps =
+        overlayBounds.maxE >= contourBounds.minE - marginE &&
+        overlayBounds.minE <= contourBounds.maxE + marginE &&
+        overlayBounds.maxN >= contourBounds.minN - marginN &&
+        overlayBounds.minN <= contourBounds.maxN + marginN;
+
+      if (overlaps) {
+        return {
+          minE: Math.min(contourBounds.minE, overlayBounds.minE),
+          maxE: Math.max(contourBounds.maxE, overlayBounds.maxE),
+          minN: Math.min(contourBounds.minN, overlayBounds.minN),
+          maxN: Math.max(contourBounds.maxN, overlayBounds.maxN),
+          source: 'dxf',
+        };
+      }
+      return contourBounds;
     }
-    if (loadedContourDxf?.planBounds) {
-      return loadedContourDxf.planBounds;
+
+    if (contourBounds) {
+      return contourBounds;
     }
-    if (loaded3DCadTransform) {
-      return cadTransformToPlanBounds(loaded3DCadTransform);
+    if (overlayBounds) {
+      return overlayBounds;
     }
     return null;
-  }, [loadedOrthophoto, dxfOverlay, loadedContourDxf, loaded3DCadTransform]);
+  }, [loadedOrthophoto, loaded3DCadTransform, loadedContourDxf, dxfOverlay]);
 
-  const hasAny3DSource = Boolean(activeExternal3DSource || activeContourDxfTarget);
+  const hasAny3DSource = Boolean(
+    activeExternal3DSource || activeContourDxfTarget || activeOrthoTarget
+  );
   const hasAnyOrthoSource = Boolean(activeOrthoTarget || activeContourDxfTarget);
 
   return (
@@ -817,6 +968,19 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
             terrain={terrain}
             external3DSource={activeExternal3DSource}
             customOrthoCanvas={loadedOrthophoto?.canvas ?? null}
+            orthoPlanBounds={loadedOrthophoto?.geoBounds ?? null}
+            orthoNaturalSize={
+              loadedOrthophoto
+                ? {
+                    width: loadedOrthophoto.naturalWidth,
+                    height: loadedOrthophoto.naturalHeight,
+                  }
+                : null
+            }
+            orthoLoading={orthoLoading}
+            orthoError={orthoError}
+            orthoFileName={activeOrthoTarget?.fileName ?? null}
+            onRetryOrtho={() => setOrthoReloadTick((t) => t + 1)}
             onModelBoundsChange={setLoaded3DCadTransform}
             dxfOverlay={dxfOverlay}
             dxfStockpiles={scopedStockpiles}
@@ -844,21 +1008,11 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
                 </h3>
                 <p className="text-xs sm:text-sm text-gray-300 leading-relaxed">
                   {isAdmin
-                    ? 'No hay ningún modelo 3D ni DXF de curvado subido para este cliente o vuelo. Sube un archivo (.OBJ, .GLB, .PLY, .STL, .LAS, .XYZ, .PCD o .DXF) para que el cliente pueda visualizarlo.'
-                    : 'No hay ningún archivo de modelo 3D disponible para visualizar en este momento. Por favor, ponte en contacto con el administrador para que suba los archivos del modelo.'}
+                    ? 'No hay ningún modelo 3D, ortofoto ni DXF de curvado subido para este cliente o vuelo. Sube un archivo (.OBJ, .GLB, .PLY, .STL, .LAS, .XYZ, .PCD, .TIF, .PNG, .JPG o .DXF) para que el cliente pueda visualizarlo.'
+                    : 'No hay ningún archivo de modelo 3D ni ortofoto disponible para visualizar en este momento. Por favor, ponte en contacto con el administrador para que suba los archivos del vuelo.'}
                 </p>
               </div>
               <div className="flex flex-wrap items-center justify-center gap-2.5 pt-2">
-                {compatibleOrthoDeliverables.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => setViewerMode('2d')}
-                    className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 shadow cursor-pointer transition"
-                  >
-                    <MapIcon className="w-3.5 h-3.5" />
-                    <span>Ver Ortofoto en Planos 2D</span>
-                  </button>
-                )}
                 {isAdmin && onOpenUploadModal && (
                   <button
                     type="button"
@@ -866,7 +1020,7 @@ export const PhotogrammetryWorkspace: React.FC<PhotogrammetryWorkspaceProps> = (
                     className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 shadow cursor-pointer transition"
                   >
                     <Upload className="w-3.5 h-3.5" />
-                    <span>Subir Modelo 3D / DXF al Cliente</span>
+                    <span>Subir Modelo / Ortofoto / DXF al Cliente</span>
                   </button>
                 )}
               </div>

@@ -127,14 +127,22 @@ export function pickSurfacePoint3D(
     hasExternal: boolean;
     terrainMesh: THREE.Mesh;
     externalHost: THREE.Group;
+    customOrthoMesh?: THREE.Mesh | null;
     maxPointSamples?: number;
   }
 ): THREE.Vector3 | null {
   raycaster.setFromCamera(pointerNdc, camera);
 
   if (!options.hasExternal) {
-    const hits = raycaster.intersectObject(options.terrainMesh, false);
-    return hits.length > 0 ? hits[0].point.clone() : null;
+    if (options.customOrthoMesh?.visible) {
+      const orthoHits = raycaster.intersectObject(options.customOrthoMesh, false);
+      if (orthoHits.length > 0) return orthoHits[0].point.clone();
+    }
+    if (options.terrainMesh.visible) {
+      const hits = raycaster.intersectObject(options.terrainMesh, false);
+      if (hits.length > 0) return hits[0].point.clone();
+    }
+    return null;
   }
 
   const meshes: THREE.Mesh[] = [];
@@ -161,42 +169,49 @@ export function pickSurfacePoint3D(
       const pos = pc.geometry.attributes.position;
       if (pos) totalPoints += pos.count;
     }
-    if (totalPoints === 0) return null;
+    if (totalPoints > 0) {
+      const sampleBudget = Math.max(2000, options.maxPointSamples ?? 60_000);
+      const step = Math.max(1, Math.floor(totalPoints / sampleBudget));
+      const ray = raycaster.ray;
 
-    const sampleBudget = Math.max(2000, options.maxPointSamples ?? 60_000);
-    const step = Math.max(1, Math.floor(totalPoints / sampleBudget));
-    const ray = raycaster.ray;
+      let bestDistCam = Infinity;
+      let bestPoint: THREE.Vector3 | null = null;
+      let fallbackAngular = Infinity;
+      let fallbackPoint: THREE.Vector3 | null = null;
 
-    let bestDistCam = Infinity;
-    let bestPoint: THREE.Vector3 | null = null;
-    let fallbackAngular = Infinity;
-    let fallbackPoint: THREE.Vector3 | null = null;
+      for (const pc of pointClouds) {
+        const pos = pc.geometry.attributes.position as THREE.BufferAttribute | undefined;
+        if (!pos) continue;
+        _tmpMatWorld.copy(pc.matrixWorld);
 
-    for (const pc of pointClouds) {
-      const pos = pc.geometry.attributes.position as THREE.BufferAttribute | undefined;
-      if (!pos) continue;
-      _tmpMatWorld.copy(pc.matrixWorld);
+        for (let i = 0; i < pos.count; i += step) {
+          _tmpVecA.fromBufferAttribute(pos, i).applyMatrix4(_tmpMatWorld);
+          const distCam = _tmpVecA.distanceTo(ray.origin);
+          if (distCam < 0.5) continue;
+          const distRay = ray.distanceToPoint(_tmpVecA);
+          const angularErr = distRay / distCam;
 
-      for (let i = 0; i < pos.count; i += step) {
-        _tmpVecA.fromBufferAttribute(pos, i).applyMatrix4(_tmpMatWorld);
-        const distCam = _tmpVecA.distanceTo(ray.origin);
-        if (distCam < 0.5) continue;
-        const distRay = ray.distanceToPoint(_tmpVecA);
-        const angularErr = distRay / distCam;
-
-        if (angularErr < 0.022 && distCam < bestDistCam) {
-          bestDistCam = distCam;
-          if (!bestPoint) bestPoint = new THREE.Vector3();
-          bestPoint.copy(_tmpVecA);
-        } else if (angularErr < 0.055 && angularErr < fallbackAngular) {
-          fallbackAngular = angularErr;
-          if (!fallbackPoint) fallbackPoint = new THREE.Vector3();
-          fallbackPoint.copy(_tmpVecA);
+          if (angularErr < 0.022 && distCam < bestDistCam) {
+            bestDistCam = distCam;
+            if (!bestPoint) bestPoint = new THREE.Vector3();
+            bestPoint.copy(_tmpVecA);
+          } else if (angularErr < 0.055 && angularErr < fallbackAngular) {
+            fallbackAngular = angularErr;
+            if (!fallbackPoint) fallbackPoint = new THREE.Vector3();
+            fallbackPoint.copy(_tmpVecA);
+          }
         }
       }
-    }
 
-    return bestPoint ?? fallbackPoint;
+      if (bestPoint ?? fallbackPoint) {
+        return bestPoint ?? fallbackPoint;
+      }
+    }
+  }
+
+  if (options.customOrthoMesh?.visible) {
+    const orthoHits = raycaster.intersectObject(options.customOrthoMesh, false);
+    if (orthoHits.length > 0) return orthoHits[0].point.clone();
   }
 
   return null;

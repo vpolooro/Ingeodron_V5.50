@@ -200,6 +200,41 @@ function deduplicateClosedVertices(pts: DxfPoint3D[]): DxfPoint3D[] {
   return out;
 }
 
+function ocsToWcs(
+  ox: number,
+  oy: number,
+  oz: number,
+  nx: number,
+  ny: number,
+  nz: number
+): DxfPoint3D {
+  if (Math.abs(nx) < 1e-9 && Math.abs(ny) < 1e-9 && Math.abs(nz - 1) < 1e-9) {
+    return { x: ox, y: oy, z: oz };
+  }
+  const nLen = Math.hypot(nx, ny, nz) || 1;
+  const N = [nx / nLen, ny / nLen, nz / nLen];
+  // AutoCAD Arbitrary Axis Algorithm
+  const useWorldY = Math.abs(N[0]) < 1 / 64 && Math.abs(N[1]) < 1 / 64;
+  const ref = useWorldY ? [0, 1, 0] : [0, 0, 1];
+  const axRaw = [
+    ref[1] * N[2] - ref[2] * N[1],
+    ref[2] * N[0] - ref[0] * N[2],
+    ref[0] * N[1] - ref[1] * N[0],
+  ];
+  const axLen = Math.hypot(axRaw[0], axRaw[1], axRaw[2]) || 1;
+  const Ax = [axRaw[0] / axLen, axRaw[1] / axLen, axRaw[2] / axLen];
+  const Ay = [
+    N[1] * Ax[2] - N[2] * Ax[1],
+    N[2] * Ax[0] - N[0] * Ax[2],
+    N[0] * Ax[1] - N[1] * Ax[0],
+  ];
+  return {
+    x: Ax[0] * ox + Ay[0] * oy + N[0] * oz,
+    y: Ax[1] * ox + Ay[1] * oy + N[1] * oz,
+    z: Ax[2] * ox + Ay[2] * oy + N[2] * oz,
+  };
+}
+
 export interface ParsedDxfOverlayResult {
   polygons: DxfPolygonRegion[];
   surfaceCount: number;
@@ -233,6 +268,28 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
   const rawTriangles: RawTriangle[] = [];
   const rawLabels: RawTextLabel[] = [];
 
+  interface BlockDef {
+    name: string;
+    base: DxfPoint3D;
+    polys: RawPoly[];
+    tris: RawTriangle[];
+    labels: RawTextLabel[];
+  }
+  const blocks = new Map<string, BlockDef>();
+  let curBlock: BlockDef | null = null;
+  const pendingInserts: Array<{
+    blockName: string;
+    x: number;
+    y: number;
+    z: number;
+    sx: number;
+    sy: number;
+    sz: number;
+    rotDeg: number;
+    layer: string;
+    color?: number;
+  }> = [];
+
   let section = '';
   let inLayerTable = false;
   let curLayerName = '';
@@ -243,6 +300,7 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
   let curColor: number | undefined;
   let curFlags = 0;
   let curElev = 0;
+  let curExtrude: [number, number, number] = [0, 0, 1];
 
   // LWPOLYLINE state
   let lwVerts: DxfPoint3D[] = [];
@@ -256,6 +314,7 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
   let polyFlags = 0;
   let polyDefaultZ = 0;
   let polyMeshN = 0;
+  let polyExtrude: [number, number, number] = [0, 0, 1];
   let polyVertices: DxfPoint3D[] = [];
   let polyMeshVerts: DxfPoint3D[] = [];
   let polyMeshFaces: Array<[number, number, number, number]> = [];
@@ -280,8 +339,22 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
   let curTextY = 0;
   let curTextZ = 0;
 
+  // INSERT state
+  let curInsertName = '';
+  let curInsertX = 0;
+  let curInsertY = 0;
+  let curInsertZ = 0;
+  let curInsertSx = 1;
+  let curInsertSy = 1;
+  let curInsertSz = 1;
+  let curInsertRot = 0;
+
+  const targetPolys = () => (section === 'BLOCKS' && curBlock ? curBlock.polys : rawPolys);
+  const targetTris = () => (section === 'BLOCKS' && curBlock ? curBlock.tris : rawTriangles);
+  const targetLabels = () => (section === 'BLOCKS' && curBlock ? curBlock.labels : rawLabels);
+
   const pushTri = (layer: string, color: number | undefined, a: DxfPoint3D, b: DxfPoint3D, c: DxfPoint3D) => {
-    rawTriangles.push({
+    targetTris().push({
       layer,
       color,
       verts: [a, b, c],
@@ -298,11 +371,11 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
 
     if (entityType === 'LWPOLYLINE') {
       if (lwPendingX !== null && lwPendingY !== null) {
-        lwVerts.push({ x: lwPendingX, y: lwPendingY, z: curElev });
+        lwVerts.push(ocsToWcs(lwPendingX, lwPendingY, curElev, curExtrude[0], curExtrude[1], curExtrude[2]));
       }
       const cleaned = deduplicateClosedVertices(lwVerts);
       if (cleaned.length >= 3) {
-        rawPolys.push({
+        targetPolys().push({
           layer: curLayer,
           color: curColor,
           closed: (curFlags & 1) === 1 || lwVerts.length > cleaned.length,
@@ -314,11 +387,11 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
       if ((polyFlags & 64) === 64 && isFaceIndex) {
         polyMeshFaces.push([curFaceIdx[0], curFaceIdx[1], curFaceIdx[2], curFaceIdx[3]]);
       } else {
-        const pt: DxfPoint3D = {
-          x: curVertexX,
-          y: curVertexY,
-          z: Number.isFinite(curVertexZ) ? curVertexZ : polyDefaultZ,
-        };
+        const rawZ = Number.isFinite(curVertexZ) ? curVertexZ : polyDefaultZ;
+        const is3dPoly = (polyFlags & 8) === 8 || (polyFlags & 16) === 16 || (polyFlags & 64) === 64;
+        const pt: DxfPoint3D = is3dPoly
+          ? { x: curVertexX, y: curVertexY, z: rawZ }
+          : ocsToWcs(curVertexX, curVertexY, rawZ, polyExtrude[0], polyExtrude[1], polyExtrude[2]);
         if ((polyFlags & 64) === 64 || (polyFlags & 16) === 16) {
           polyMeshVerts.push(pt);
         } else {
@@ -342,14 +415,36 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
     } else if (entityType === 'TEXT' || entityType === 'MTEXT') {
       const clean = cleanDxfText(curTextStr);
       if (clean) {
-        rawLabels.push({
+        const pt = ocsToWcs(curTextX, curTextY, curTextZ, curExtrude[0], curExtrude[1], curExtrude[2]);
+        targetLabels().push({
           layer: curLayer,
           text: clean,
-          x: curTextX,
-          y: curTextY,
-          z: curTextZ,
+          x: pt.x,
+          y: pt.y,
+          z: pt.z,
         });
       }
+    } else if (entityType === 'INSERT' && section === 'ENTITIES' && curInsertName) {
+      const wcsOrigin = ocsToWcs(
+        curInsertX,
+        curInsertY,
+        curInsertZ,
+        curExtrude[0],
+        curExtrude[1],
+        curExtrude[2]
+      );
+      pendingInserts.push({
+        blockName: curInsertName,
+        x: wcsOrigin.x,
+        y: wcsOrigin.y,
+        z: wcsOrigin.z,
+        sx: Number.isFinite(curInsertSx) && curInsertSx !== 0 ? curInsertSx : 1,
+        sy: Number.isFinite(curInsertSy) && curInsertSy !== 0 ? curInsertSy : 1,
+        sz: Number.isFinite(curInsertSz) && curInsertSz !== 0 ? curInsertSz : 1,
+        rotDeg: Number.isFinite(curInsertRot) ? curInsertRot : 0,
+        layer: curLayer,
+        color: curColor,
+      });
     }
 
     entityType = '';
@@ -358,7 +453,6 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
   const flushPolyline = () => {
     if (!inPolyline) return;
     if ((polyFlags & 64) === 64) {
-      // Polyface mesh -> extract triangles from 1-based vertex indices
       for (const face of polyMeshFaces) {
         const idxList = face.map((v) => Math.abs(v) - 1).filter((idx) => idx >= 0 && idx < polyMeshVerts.length);
         if (idxList.length >= 3) {
@@ -381,7 +475,6 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
         }
       }
     } else if ((polyFlags & 16) === 16 && polyMeshN >= 2 && polyMeshVerts.length >= 4) {
-      // Polygon grid mesh (M x N)
       const n = polyMeshN;
       const m = Math.floor(polyMeshVerts.length / n);
       for (let r = 0; r < m - 1; r++) {
@@ -397,7 +490,7 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
     } else {
       const cleaned = deduplicateClosedVertices(polyVertices);
       if (cleaned.length >= 3) {
-        rawPolys.push({
+        targetPolys().push({
           layer: polyLayer,
           color: polyColor,
           closed: (polyFlags & 1) === 1 || polyVertices.length > cleaned.length,
@@ -418,6 +511,7 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
       if (val === 'SECTION') {
         flushEntity();
         flushPolyline();
+        curBlock = null;
         if (i + 1 < pairs.length && pairs[i + 1][0] === 2) {
           section = pairs[i + 1][1].toUpperCase();
         }
@@ -426,6 +520,10 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
       if (val === 'ENDSEC' || val === 'EOF') {
         flushEntity();
         flushPolyline();
+        if (curBlock && curBlock.name) {
+          blocks.set(curBlock.name, curBlock);
+        }
+        curBlock = null;
         inLayerTable = false;
         section = '';
         continue;
@@ -455,7 +553,27 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
         }
       }
 
-      if (section === 'ENTITIES' || section === 'BLOCKS') {
+      if (section === 'BLOCKS') {
+        if (val === 'BLOCK') {
+          flushEntity();
+          flushPolyline();
+          curBlock = { name: '', base: { x: 0, y: 0, z: 0 }, polys: [], tris: [], labels: [] };
+          entityType = 'BLOCK_HEADER';
+          continue;
+        }
+        if (val === 'ENDBLK') {
+          flushEntity();
+          flushPolyline();
+          if (curBlock && curBlock.name) {
+            blocks.set(curBlock.name, curBlock);
+          }
+          curBlock = null;
+          entityType = '';
+          continue;
+        }
+      }
+
+      if (section === 'ENTITIES' || (section === 'BLOCKS' && curBlock !== null)) {
         flushEntity();
         if (val === 'SEQEND') {
           flushPolyline();
@@ -469,6 +587,7 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
           polyFlags = 0;
           polyDefaultZ = 0;
           polyMeshN = 0;
+          polyExtrude = [0, 0, 1];
           polyVertices = [];
           polyMeshVerts = [];
           polyMeshFaces = [];
@@ -481,6 +600,7 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
         curColor = undefined;
         curFlags = 0;
         curElev = 0;
+        curExtrude = [0, 0, 1];
         lwVerts = [];
         lwPendingX = null;
         lwPendingY = null;
@@ -499,6 +619,14 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
         curTextX = 0;
         curTextY = 0;
         curTextZ = 0;
+        curInsertName = '';
+        curInsertX = 0;
+        curInsertY = 0;
+        curInsertZ = 0;
+        curInsertSx = 1;
+        curInsertSy = 1;
+        curInsertSz = 1;
+        curInsertRot = 0;
         continue;
       }
     }
@@ -512,7 +640,15 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
       continue;
     }
 
-    if (section !== 'ENTITIES' && section !== 'BLOCKS') continue;
+    if (section === 'BLOCKS' && entityType === 'BLOCK_HEADER' && curBlock) {
+      if (code === 2) curBlock.name = val;
+      else if (code === 10) curBlock.base.x = parseFloat(val) || 0;
+      else if (code === 20) curBlock.base.y = parseFloat(val) || 0;
+      else if (code === 30) curBlock.base.z = parseFloat(val) || 0;
+      continue;
+    }
+
+    if (section !== 'ENTITIES' && !(section === 'BLOCKS' && curBlock !== null)) continue;
 
     if (entityType === 'POLYLINE') {
       if (code === 8) polyLayer = val || '0';
@@ -522,6 +658,9 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
       } else if (code === 70) polyFlags = parseInt(val, 10) || 0;
       else if (code === 72) polyMeshN = parseInt(val, 10) || 0;
       else if (code === 30) polyDefaultZ = parseFloat(val) || 0;
+      else if (code === 210) polyExtrude[0] = parseFloat(val) || 0;
+      else if (code === 220) polyExtrude[1] = parseFloat(val) || 0;
+      else if (code === 230) polyExtrude[2] = parseFloat(val) || 1;
       continue;
     }
 
@@ -544,16 +683,19 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
         if (Number.isFinite(c)) curColor = Math.abs(c);
       } else if (code === 70) curFlags = parseInt(val, 10) || 0;
       else if (code === 38) curElev = parseFloat(val) || 0;
+      else if (code === 210) curExtrude[0] = parseFloat(val) || 0;
+      else if (code === 220) curExtrude[1] = parseFloat(val) || 0;
+      else if (code === 230) curExtrude[2] = parseFloat(val) || 1;
       else if (code === 10) {
         if (lwPendingX !== null && lwPendingY !== null) {
-          lwVerts.push({ x: lwPendingX, y: lwPendingY, z: curElev });
+          lwVerts.push(ocsToWcs(lwPendingX, lwPendingY, curElev, curExtrude[0], curExtrude[1], curExtrude[2]));
         }
         lwPendingX = parseFloat(val) || 0;
         lwPendingY = null;
       } else if (code === 20) {
         lwPendingY = parseFloat(val) || 0;
         if (lwPendingX !== null) {
-          lwVerts.push({ x: lwPendingX, y: lwPendingY, z: curElev });
+          lwVerts.push(ocsToWcs(lwPendingX, lwPendingY, curElev, curExtrude[0], curExtrude[1], curExtrude[2]));
           lwPendingX = null;
           lwPendingY = null;
         }
@@ -587,11 +729,95 @@ export function parseDxfOverlayText(dxfText: string): ParsedDxfOverlayResult {
       else if (code === 10) curTextX = parseFloat(val) || 0;
       else if (code === 20) curTextY = parseFloat(val) || 0;
       else if (code === 30) curTextZ = parseFloat(val) || 0;
+      else if (code === 210) curExtrude[0] = parseFloat(val) || 0;
+      else if (code === 220) curExtrude[1] = parseFloat(val) || 0;
+      else if (code === 230) curExtrude[2] = parseFloat(val) || 1;
+      continue;
+    }
+
+    if (entityType === 'INSERT') {
+      if (code === 8) curLayer = val || '0';
+      else if (code === 62) {
+        const c = parseInt(val, 10);
+        if (Number.isFinite(c)) curColor = Math.abs(c);
+      } else if (code === 2) curInsertName = val;
+      else if (code === 10) curInsertX = parseFloat(val) || 0;
+      else if (code === 20) curInsertY = parseFloat(val) || 0;
+      else if (code === 30) curInsertZ = parseFloat(val) || 0;
+      else if (code === 41) curInsertSx = parseFloat(val) || 1;
+      else if (code === 42) curInsertSy = parseFloat(val) || 1;
+      else if (code === 43) curInsertSz = parseFloat(val) || 1;
+      else if (code === 50) curInsertRot = parseFloat(val) || 0;
+      else if (code === 210) curExtrude[0] = parseFloat(val) || 0;
+      else if (code === 220) curExtrude[1] = parseFloat(val) || 0;
+      else if (code === 230) curExtrude[2] = parseFloat(val) || 1;
     }
   }
 
   flushEntity();
   flushPolyline();
+
+  // Expand INSERT references from ENTITIES using block definitions
+  for (const ins of pendingInserts) {
+    const blk = blocks.get(ins.blockName);
+    if (!blk) continue;
+    const rad = (ins.rotDeg * Math.PI) / 180;
+    const cosR = Math.cos(rad);
+    const sinR = Math.sin(rad);
+    const xformPt = (pt: DxfPoint3D): DxfPoint3D => {
+      const lx = (pt.x - blk.base.x) * ins.sx;
+      const ly = (pt.y - blk.base.y) * ins.sy;
+      const lz = (pt.z - blk.base.z) * ins.sz;
+      return {
+        x: ins.x + lx * cosR - ly * sinR,
+        y: ins.y + lx * sinR + ly * cosR,
+        z: ins.z + lz,
+      };
+    };
+    for (const p of blk.polys) {
+      rawPolys.push({
+        layer: p.layer === '0' ? ins.layer : p.layer,
+        color: p.color ?? ins.color,
+        closed: p.closed,
+        vertices: p.vertices.map(xformPt),
+      });
+    }
+    for (const t of blk.tris) {
+      const a = xformPt(t.verts[0]);
+      const b = xformPt(t.verts[1]);
+      const c = xformPt(t.verts[2]);
+      rawTriangles.push({
+        layer: t.layer === '0' ? ins.layer : t.layer,
+        color: t.color ?? ins.color,
+        verts: [a, b, c],
+        centroid: {
+          x: (a.x + b.x + c.x) / 3,
+          y: (a.y + b.y + c.y) / 3,
+          z: (a.z + b.z + c.z) / 3,
+        },
+      });
+    }
+    for (const lbl of blk.labels) {
+      const p = xformPt({ x: lbl.x, y: lbl.y, z: lbl.z });
+      rawLabels.push({
+        layer: lbl.layer === '0' ? ins.layer : lbl.layer,
+        text: lbl.text,
+        x: p.x,
+        y: p.y,
+        z: p.z,
+      });
+    }
+  }
+
+  // Only fall back to non-system BLOCKS if ENTITIES & INSERTs yielded nothing
+  if (rawPolys.length === 0 && rawTriangles.length === 0) {
+    for (const blk of blocks.values()) {
+      if (blk.name.startsWith('*')) continue;
+      rawPolys.push(...blk.polys);
+      rawTriangles.push(...blk.tris);
+      rawLabels.push(...blk.labels);
+    }
+  }
 
   // If DXF has 3D faces/surfaces grouped by layer without explicit boundary polylines,
   // derive an outer perimeter convex hull per layer so every 3D surface zone is assignable.
@@ -816,8 +1042,8 @@ export function createDxfWorldMapper(
     const pbSpanN = Math.max(1e-4, pb.maxN - pb.minN);
     const pbCenterE = (pb.minE + pb.maxE) * 0.5;
     const pbCenterN = (pb.minN + pb.maxN) * 0.5;
-    const marginE = Math.max(50, pbSpanE * 0.35);
-    const marginN = Math.max(50, pbSpanN * 0.35);
+    const marginE = Math.max(150, Math.max(pbSpanE, spanX) * 0.75);
+    const marginN = Math.max(150, Math.max(pbSpanN, spanY) * 0.75);
     const overlapsPlan =
       bounds.maxX >= pb.minE - marginE &&
       bounds.minX <= pb.maxE + marginE &&

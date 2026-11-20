@@ -2227,6 +2227,13 @@ export default function App() {
     } else if (
       lower.endsWith('.tif') ||
       lower.endsWith('.tiff') ||
+      lower.endsWith('.tfw') ||
+      lower.endsWith('.tfwx') ||
+      lower.endsWith('.jgw') ||
+      lower.endsWith('.jgwx') ||
+      lower.endsWith('.pgw') ||
+      lower.endsWith('.pgwx') ||
+      lower.endsWith('.wld') ||
       lower.endsWith('.png') ||
       lower.endsWith('.jpg') ||
       lower.endsWith('.jpeg') ||
@@ -2235,6 +2242,8 @@ export default function App() {
       detectedCategory = 'orthophoto';
     } else if (
       lower.endsWith('.obj') ||
+      lower.endsWith('.mtl') ||
+      lower.endsWith('.bin') ||
       lower.endsWith('.glb') ||
       lower.endsWith('.gltf') ||
       lower.endsWith('.stl')
@@ -5924,7 +5933,7 @@ export default function App() {
                     <label className="flex flex-col items-center justify-center gap-1.5 w-full border border-dashed border-blue-500/50 hover:border-blue-400 bg-[#0b0f17] rounded-xl p-4 cursor-pointer transition text-center">
                       <Upload className="w-5 h-5 text-blue-400" />
                       <span className="text-gray-200 font-semibold">
-                        {selectedUploadFile ? selectedUploadFile.name : 'Haz clic para elegir archivo (OBJ, GLB, PLY, STL, LAS, XYZ, TIF, PNG, JPG, DXF, PDF)'}
+                        {selectedUploadFile ? selectedUploadFile.name : 'Haz clic para elegir archivo (OBJ/MTL, GLB, PLY, STL, LAS, XYZ, TIF/TFW, PNG, JPG, DXF, PDF)'}
                       </span>
                       <span className="text-[10px] text-gray-400">
                         {selectedUploadFile

@@ -48,12 +48,16 @@ import {
 } from '../utils/quarryTerrainModel.ts';
 import { formatDateEu } from '../utils/dateUtils.ts';
 import {
+  cadToSceneXZ,
   createPointCircleSpriteTexture,
   load3DAssetFromUrl,
+  planBoundsOverlapCad,
   scenePointToCadCoords,
   type CadTransform,
+  type CompanionAssetRef,
   type Load3DProgressInfo,
   type Loaded3DAssetResult,
+  type PlanCoordinateBounds,
 } from '../utils/threeFileLoader.ts';
 import {
   POLYGON_COLOR_PRESETS,
@@ -87,6 +91,7 @@ export interface External3DSource {
   url: string;
   fileName: string;
   label: string;
+  companionAssets?: CompanionAssetRef[];
 }
 
 interface Quarry3DViewerProps {
@@ -95,6 +100,12 @@ interface Quarry3DViewerProps {
   terrain: QuarryTerrainData;
   external3DSource?: External3DSource | null;
   customOrthoCanvas?: HTMLCanvasElement | null;
+  orthoPlanBounds?: PlanCoordinateBounds | null;
+  orthoNaturalSize?: { width: number; height: number } | null;
+  orthoLoading?: boolean;
+  orthoError?: string | null;
+  orthoFileName?: string | null;
+  onRetryOrtho?: () => void;
   onClearExternal3D?: () => void;
   onModelBoundsChange?: (cadTransform: CadTransform | null) => void;
   dxfOverlay?: FlightDxfOverlay | null;
@@ -193,6 +204,12 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   terrain,
   external3DSource = null,
   customOrthoCanvas = null,
+  orthoPlanBounds = null,
+  orthoNaturalSize = null,
+  orthoLoading = false,
+  orthoError = null,
+  orthoFileName = null,
+  onRetryOrtho,
   onClearExternal3D,
   onModelBoundsChange,
   dxfOverlay = null,
@@ -345,6 +362,11 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   const contourDxfRef = useRef<ParsedDxfContours | null>(contourDxf);
   const showDxfContoursRef = useRef<boolean>(showDxfContours);
   const contourCadTransformRef = useRef<CadTransform | null>(null);
+  const orthoCadTransformRef = useRef<CadTransform | null>(null);
+  const customOrthoCanvasRef = useRef<HTMLCanvasElement | null>(customOrthoCanvas);
+  const orthoPlanBoundsRef = useRef<PlanCoordinateBounds | null>(orthoPlanBounds);
+  const orthoNaturalSizeRef = useRef<{ width: number; height: number } | null>(orthoNaturalSize);
+  const orthoLoadingRef = useRef<boolean>(orthoLoading);
   const dxfOpacityRef = useRef<number>(dxfOpacity);
   const selectedDxfPolyIdRef = useRef<string | null>(selectedDxfPolyId);
   const dxfFocusTargetsRef = useRef<Map<string, { center: THREE.Vector3; span: number }>>(new Map());
@@ -362,6 +384,10 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   showDxfOverlayRef.current = showDxfOverlay;
   contourDxfRef.current = contourDxf;
   showDxfContoursRef.current = showDxfContours;
+  customOrthoCanvasRef.current = customOrthoCanvas;
+  orthoPlanBoundsRef.current = orthoPlanBounds;
+  orthoNaturalSizeRef.current = orthoNaturalSize;
+  orthoLoadingRef.current = orthoLoading;
   dxfOpacityRef.current = dxfOpacity;
   selectedDxfPolyIdRef.current = selectedDxfPolyId;
   hasExternalRef.current = Boolean(external3DSource);
@@ -488,6 +514,8 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     baseGrid: THREE.GridHelper;
     defaultOrthoTexture: THREE.CanvasTexture;
     customOrthoTexture: THREE.CanvasTexture | null;
+    customOrthoMesh: THREE.Mesh;
+    customOrthoMat: THREE.MeshStandardMaterial;
     maxAniso: number;
     cameraGoal: CameraGoal;
     requestRender: () => void;
@@ -501,6 +529,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     rebuildDrawOverlay: () => void;
     rebuildDxfOverlay: () => void;
     rebuildDxfContourOverlay: () => void;
+    rebuildCustomOrthoPlane: () => void;
     isSoftwareGl: boolean;
   } | null>(null);
 
@@ -918,6 +947,21 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         const distH = radius / Math.sin(hFov / 2);
         fitDist = Math.max(distV, distH) * 0.92;
       }
+    } else if (customOrthoCanvasRef.current && ctx.customOrthoMesh.visible) {
+      ctx.customOrthoMesh.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(ctx.customOrthoMesh);
+      if (!box.isEmpty()) {
+        const size = new THREE.Vector3();
+        box.getCenter(target);
+        box.getSize(size);
+        const radius = Math.max(40, size.length() * 0.5);
+        const vFov = THREE.MathUtils.degToRad(ctx.camera.fov);
+        const aspect = Math.max(0.5, ctx.camera.aspect || 1.4);
+        const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect);
+        const distV = radius / Math.sin(vFov / 2);
+        const distH = radius / Math.sin(hFov / 2);
+        fitDist = Math.max(distV, distH) * 0.94;
+      }
     } else {
       const visSpan = computeDemVisualSpan(zMinMRef.current, zMaxMRef.current);
       target.set(0, Math.min(80, visSpan * 0.32 * exVal), 0);
@@ -1322,6 +1366,26 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     const externalHost = new THREE.Group();
     scene.add(externalHost);
 
+    // 8b. Georeferenced 3D Orthophoto RGB Base Plane (for standalone ortho, contours+ortho, or pointcloud+ortho)
+    const customOrthoMat = new THREE.MeshStandardMaterial({
+      color: '#ffffff',
+      roughness: 0.88,
+      metalness: 0.03,
+      transparent: true,
+      alphaTest: 0.02,
+      side: THREE.DoubleSide,
+      polygonOffset: true,
+      polygonOffsetFactor: 2,
+      polygonOffsetUnits: 2,
+    });
+    const customOrthoGeom: THREE.BufferGeometry = new THREE.PlaneGeometry(TERRAIN_SPAN_M, TERRAIN_SPAN_M, 1, 1);
+    customOrthoGeom.rotateX(-Math.PI / 2);
+    const customOrthoMesh: THREE.Mesh = new THREE.Mesh(customOrthoGeom, customOrthoMat);
+    customOrthoMesh.receiveShadow = !isSoftwareGl;
+    customOrthoMesh.visible = false;
+    customOrthoMesh.renderOrder = 1;
+    scene.add(customOrthoMesh);
+
     // 9. Interactive 3D Drawings Overlay (Lines, Polygons, Pins, Translucent Shading)
     const drawOverlayGroup = new THREE.Group();
     scene.add(drawOverlayGroup);
@@ -1521,9 +1585,12 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     };
 
     const updateRenderVisibility = (mode: RenderMode3D) => {
-      const extLoaded = Boolean(sceneRef.current?.externalAsset && hasExternalRef.current);
+      const extAsset = sceneRef.current?.externalAsset ?? null;
+      const extLoaded = Boolean(extAsset && hasExternalRef.current);
       const contourLoaded = Boolean(contourDxfRef.current && dxfContourGroup.children.length > 0);
-      const hideSyntheticDem = extLoaded || contourLoaded;
+      const hasCustomOrtho = Boolean(customOrthoCanvasRef.current && sceneRef.current?.customOrthoTexture);
+      const hideSyntheticDem =
+        extLoaded || contourLoaded || hasCustomOrtho || Boolean(orthoLoadingRef.current);
 
       terrainMesh.visible = !hideSyntheticDem && mode !== 'nube';
       skirtMesh.visible = !hideSyntheticDem && mode !== 'nube';
@@ -1532,14 +1599,29 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       tinWireMesh.visible = !hideSyntheticDem && mode === 'tin';
       profileGroup.visible = !hideSyntheticDem && showProfileIn3DRef.current;
       externalHost.visible = extLoaded;
+
+      const showOrthoPlane =
+        hasCustomOrtho &&
+        (!extLoaded || extAsset?.kind === 'pointcloud') &&
+        (mode === 'ortofoto' || mode === 'dxf' || (mode === 'curvas' && !extLoaded));
+      customOrthoMesh.visible = showOrthoPlane;
+      customOrthoMat.color.set(mode === 'curvas' && contourLoaded ? '#cbd5e1' : '#ffffff');
+
       dxfOverlayGroup.visible =
         Boolean(dxfOverlayRef.current) && (mode === 'dxf' || showDxfOverlayRef.current);
       dxfContourGroup.visible =
         contourLoaded && (showDxfContoursRef.current || mode === 'curvas');
 
-      if (extLoaded && sceneRef.current?.externalAsset) {
-        sceneRef.current.externalAsset.setHypsometricMode(mode === 'hipsometria');
-        sceneRef.current.externalAsset.setWireframeMode(mode === 'tin');
+      if (extLoaded && extAsset) {
+        extAsset.setHypsometricMode(mode === 'hipsometria');
+        extAsset.setWireframeMode(mode === 'tin');
+        extAsset.setOrthophotoOverlay(
+          mode === 'ortofoto' && sceneRef.current?.customOrthoTexture
+            ? sceneRef.current.customOrthoTexture
+            : null,
+          orthoPlanBoundsRef.current,
+          customOrthoCanvasRef.current
+        );
       }
 
       if (mode === 'ortofoto' || mode === 'dxf') terrainMesh.material = orthoMat;
@@ -1715,7 +1797,11 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         terrainOriginUtm: { e0: terrain.utmOriginE, n0: terrain.utmOriginN },
         demElevMinM: demElevationBoundsRef.current.minM,
         demElevMaxM: demElevationBoundsRef.current.maxM,
-        cadTransform: sceneRef.current?.externalAsset?.cadTransform ?? null,
+        cadTransform:
+          sceneRef.current?.externalAsset?.cadTransform ??
+          contourCadTransformRef.current ??
+          orthoCadTransformRef.current ??
+          null,
         hasExternal3D: hasExternalRef.current,
         externalHeightSpan: externalHeightSpanRef.current,
       });
@@ -1724,6 +1810,173 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       dxfFocusTargetsRef.current = built.focusTargets;
       dxfOverlayGroup.visible =
         renderModeRef.current === 'dxf' || showDxfOverlayRef.current;
+    };
+
+    const rebuildCustomOrthoPlane = () => {
+      const canvas = customOrthoCanvasRef.current;
+      orthoCadTransformRef.current = null;
+      if (!canvas) {
+        customOrthoMesh.visible = false;
+        return;
+      }
+
+      const natW = Math.max(1, orthoNaturalSizeRef.current?.width ?? canvas.width);
+      const natH = Math.max(1, orthoNaturalSizeRef.current?.height ?? canvas.height);
+      const extAsset = hasExternalRef.current ? sceneRef.current?.externalAsset ?? null : null;
+      const refCad = extAsset?.cadTransform ?? contourCadTransformRef.current ?? null;
+      const bounds = orthoPlanBoundsRef.current;
+
+      const setQuadFromCorners = (
+        nw: { worldX: number; worldZ: number },
+        ne: { worldX: number; worldZ: number },
+        sw: { worldX: number; worldZ: number },
+        se: { worldX: number; worldZ: number },
+        yPos: number
+      ) => {
+        const nextGeom = new THREE.BufferGeometry();
+        // PlaneGeometry rotated -PI/2 vertex order: NW (uv 0,1), NE (uv 1,1), SW (uv 0,0), SE (uv 1,0)
+        const positions = new Float32Array([
+          nw.worldX, yPos, nw.worldZ,
+          ne.worldX, yPos, ne.worldZ,
+          sw.worldX, yPos, sw.worldZ,
+          se.worldX, yPos, se.worldZ,
+        ]);
+        const normals = new Float32Array([
+          0, 1, 0,
+          0, 1, 0,
+          0, 1, 0,
+          0, 1, 0,
+        ]);
+        const uvs = new Float32Array([
+          0, 1,
+          1, 1,
+          0, 0,
+          1, 0,
+        ]);
+        nextGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        nextGeom.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+        nextGeom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+        nextGeom.setIndex([0, 2, 1, 2, 3, 1]);
+        nextGeom.computeBoundingBox();
+        nextGeom.computeBoundingSphere();
+        customOrthoMesh.geometry.dispose();
+        customOrthoMesh.geometry = nextGeom;
+      };
+
+      const yPlane = extAsset ? -0.18 : 0;
+
+      if (refCad) {
+        if (bounds && planBoundsOverlapCad(refCad, bounds)) {
+          const aff = bounds.geoAffine;
+          if (aff && aff.widthPx > 0 && aff.heightPx > 0) {
+            const cornerToScene = (px: number, py: number) => {
+              const e = aff.a * px + aff.b * py + aff.d;
+              const n = aff.e * px + aff.f * py + aff.h;
+              return cadToSceneXZ(e, n, refCad);
+            };
+            setQuadFromCorners(
+              cornerToScene(0, 0),
+              cornerToScene(aff.widthPx, 0),
+              cornerToScene(0, aff.heightPx),
+              cornerToScene(aff.widthPx, aff.heightPx),
+              yPlane
+            );
+          } else {
+            setQuadFromCorners(
+              cadToSceneXZ(bounds.minE, bounds.maxN, refCad),
+              cadToSceneXZ(bounds.maxE, bounds.maxN, refCad),
+              cadToSceneXZ(bounds.minE, bounds.minN, refCad),
+              cadToSceneXZ(bounds.maxE, bounds.minN, refCad),
+              yPlane
+            );
+          }
+        } else {
+          // Non-georeferenced image: fit centered onto the reference CAD footprint preserving image aspect
+          const refMinE = refCad.cadMin.x;
+          const refMaxE = refCad.cadMax.x;
+          const refMinN = refCad.zUp ? refCad.cadMin.y : refCad.cadMin.z;
+          const refMaxN = refCad.zUp ? refCad.cadMax.y : refCad.cadMax.z;
+          const nw = cadToSceneXZ(refMinE, refMaxN, refCad);
+          const se = cadToSceneXZ(refMaxE, refMinN, refCad);
+          const boxW = Math.max(1, Math.abs(se.worldX - nw.worldX));
+          const boxH = Math.max(1, Math.abs(se.worldZ - nw.worldZ));
+          const cx = (nw.worldX + se.worldX) * 0.5;
+          const cz = (nw.worldZ + se.worldZ) * 0.5;
+          const imgAspect = natW / natH;
+          const boxAspect = boxW / boxH;
+          const fitW = imgAspect >= boxAspect ? boxW : boxH * imgAspect;
+          const fitH = imgAspect >= boxAspect ? boxW / imgAspect : boxH;
+          setQuadFromCorners(
+            { worldX: cx - fitW * 0.5, worldZ: cz - fitH * 0.5 },
+            { worldX: cx + fitW * 0.5, worldZ: cz - fitH * 0.5 },
+            { worldX: cx - fitW * 0.5, worldZ: cz + fitH * 0.5 },
+            { worldX: cx + fitW * 0.5, worldZ: cz + fitH * 0.5 },
+            yPlane
+          );
+        }
+        return;
+      }
+
+      // Standalone orthophoto (no external 3D asset & no contour DXF)
+      const targetSpan = TERRAIN_SPAN_M * 0.92;
+      if (bounds && bounds.maxE > bounds.minE && bounds.maxN > bounds.minN) {
+        const spanE = Math.max(1e-3, bounds.maxE - bounds.minE);
+        const spanN = Math.max(1e-3, bounds.maxN - bounds.minN);
+        const scale = targetSpan / Math.max(spanE, spanN);
+        const orthoCad: CadTransform = {
+          sourceOrigin: { x: bounds.minE, y: bounds.minN, z: 0 },
+          center: { x: spanE * 0.5, y: 0, z: -spanN * 0.5 },
+          boxMinY: 0,
+          scaleFactor: scale,
+          zUp: true,
+          cadMin: { x: bounds.minE, y: bounds.minN, z: 0 },
+          cadMax: { x: bounds.maxE, y: bounds.maxN, z: 0 },
+        };
+        orthoCadTransformRef.current = orthoCad;
+        const aff = bounds.geoAffine;
+        if (aff && aff.widthPx > 0 && aff.heightPx > 0) {
+          const cornerToScene = (px: number, py: number) => {
+            const e = aff.a * px + aff.b * py + aff.d;
+            const n = aff.e * px + aff.f * py + aff.h;
+            return cadToSceneXZ(e, n, orthoCad);
+          };
+          setQuadFromCorners(
+            cornerToScene(0, 0),
+            cornerToScene(aff.widthPx, 0),
+            cornerToScene(0, aff.heightPx),
+            cornerToScene(aff.widthPx, aff.heightPx),
+            0
+          );
+        } else {
+          setQuadFromCorners(
+            cadToSceneXZ(bounds.minE, bounds.maxN, orthoCad),
+            cadToSceneXZ(bounds.maxE, bounds.maxN, orthoCad),
+            cadToSceneXZ(bounds.minE, bounds.minN, orthoCad),
+            cadToSceneXZ(bounds.maxE, bounds.minN, orthoCad),
+            0
+          );
+        }
+      } else {
+        const imgAspect = natW / natH;
+        const w = imgAspect >= 1 ? targetSpan : targetSpan * imgAspect;
+        const h = imgAspect >= 1 ? targetSpan / imgAspect : targetSpan;
+        orthoCadTransformRef.current = {
+          sourceOrigin: { x: 0, y: 0, z: 0 },
+          center: { x: w * 0.5, y: 0, z: -h * 0.5 },
+          boxMinY: 0,
+          scaleFactor: 1,
+          zUp: true,
+          cadMin: { x: 0, y: 0, z: 0 },
+          cadMax: { x: w, y: h, z: 0 },
+        };
+        setQuadFromCorners(
+          { worldX: -w * 0.5, worldZ: -h * 0.5 },
+          { worldX: w * 0.5, worldZ: -h * 0.5 },
+          { worldX: -w * 0.5, worldZ: h * 0.5 },
+          { worldX: w * 0.5, worldZ: h * 0.5 },
+          0
+        );
+      }
     };
 
     const rebuildDxfContourOverlay = () => {
@@ -1799,10 +2052,13 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
           hasExternal: hasExternalRef.current,
           terrainMesh,
           externalHost,
+          customOrthoMesh,
         });
         if (hoverHit) {
           const baseY = hoverHit.y / Math.max(0.01, exaggerationRef.current);
-          const cadT = hasExternalRef.current ? sceneRef.current?.externalAsset?.cadTransform : null;
+          const cadT = hasExternalRef.current
+            ? sceneRef.current?.externalAsset?.cadTransform
+            : contourCadTransformRef.current ?? orthoCadTransformRef.current;
           if (cadT) {
             const cad = scenePointToCadCoords(hoverHit.x, baseY, hoverHit.z, cadT);
             setCursorCoords({
@@ -1844,13 +2100,16 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         hasExternal: hasExternalRef.current,
         terrainMesh,
         externalHost,
+        customOrthoMesh,
         maxPointSamples: 8000,
       });
 
       if (hit) {
         const baseY = hit.y / Math.max(0.01, exaggerationRef.current);
         previewDrawPointRef.current = { x: hit.x, baseY, z: hit.z };
-        const cadT = hasExternalRef.current ? sceneRef.current?.externalAsset?.cadTransform : null;
+        const cadT = hasExternalRef.current
+          ? sceneRef.current?.externalAsset?.cadTransform
+          : contourCadTransformRef.current ?? orthoCadTransformRef.current;
         if (cadT) {
           const cad = scenePointToCadCoords(hit.x, baseY, hit.z, cadT);
           setCursorCoords({
@@ -1896,6 +2155,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
           hasExternal: hasExternalRef.current,
           terrainMesh,
           externalHost,
+          customOrthoMesh,
           maxPointSamples: 60_000,
         });
         if (!hit) return;
@@ -2078,6 +2338,8 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       baseGrid,
       defaultOrthoTexture: orthoTexture,
       customOrthoTexture: null,
+      customOrthoMesh,
+      customOrthoMat,
       maxAniso,
       cameraGoal,
       requestRender,
@@ -2087,12 +2349,14 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       rebuildDrawOverlay,
       rebuildDxfOverlay,
       rebuildDxfContourOverlay,
+      rebuildCustomOrthoPlane,
       isSoftwareGl,
     };
 
     rebuildDrawOverlay();
-    rebuildDxfOverlay();
     rebuildDxfContourOverlay();
+    rebuildCustomOrthoPlane();
+    rebuildDxfOverlay();
     updateRenderVisibility(renderModeRef.current);
     requestRender();
 
@@ -2118,6 +2382,8 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         sceneRef.current.customOrthoTexture.dispose();
         sceneRef.current.customOrthoTexture = null;
       }
+      customOrthoMesh.geometry.dispose();
+      customOrthoMat.dispose();
       controls.dispose();
       envTarget.dispose();
       pmrem.dispose();
@@ -2208,6 +2474,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     if (!external3DSource) {
       clearExistingExternal();
       ctx.rebuildDxfContourOverlay();
+      ctx.rebuildCustomOrthoPlane();
       if (contourDxfRef.current && contourCadTransformRef.current) {
         ctx.baseGrid.position.y = -0.5;
         onModelBoundsChangeRef.current?.({ ...contourCadTransformRef.current });
@@ -2220,6 +2487,15 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         setZMinM(cMinZ);
         setZMaxM(cMaxZ);
         setRefPlaneElevM(Math.round(((cMinZ + cMaxZ) * 0.5) * 10) / 10);
+      } else if (customOrthoCanvasRef.current && orthoCadTransformRef.current) {
+        ctx.baseGrid.position.y = -0.5;
+        onModelBoundsChangeRef.current?.({ ...orthoCadTransformRef.current });
+        metersPerUnitRef.current = 1 / Math.max(1e-9, orthoCadTransformRef.current.scaleFactor);
+        zMinMRef.current = 0;
+        zMaxMRef.current = 1;
+        setZMinM(0);
+        setZMaxM(1);
+        setRefPlaneElevM(0);
       } else {
         ctx.baseGrid.position.y = -14.2;
         onModelBoundsChangeRef.current?.(null);
@@ -2241,7 +2517,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       ctx.updateRenderVisibility(renderModeRef.current);
       ctx.rebuildDrawOverlay();
       ctx.rebuildDxfOverlay();
-      if (contourDxfRef.current) {
+      if (contourDxfRef.current || customOrthoCanvasRef.current) {
         computeModelFramingGoal('oblique', exaggerationRef.current, true);
       }
       ctx.requestRender();
@@ -2272,6 +2548,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       maxPoints: pointMaxCount,
       pointSize: pointSizeRef.current,
       maxAnisotropy: ctx.maxAniso,
+      companionAssets: external3DSource.companionAssets,
       onProgress: (info) => {
         if (cancelled) return;
         latestBytes = info.loadedBytes;
@@ -2302,6 +2579,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
           kind: asset.kind,
         });
         ctx.rebuildDxfContourOverlay();
+        ctx.rebuildCustomOrthoPlane();
         ctx.updateRenderVisibility(renderModeRef.current);
         ctx.rebuildDrawOverlay();
         ctx.rebuildDxfOverlay();
@@ -2374,7 +2652,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     ctx.requestRender();
   }, [pointSize]);
 
-  // Swap custom uploaded orthophoto CanvasTexture on DEM
+  // Swap custom uploaded orthophoto CanvasTexture on DEM, 3D base plane & external models
   useEffect(() => {
     const ctx = sceneRef.current;
     if (!ctx) return;
@@ -2388,19 +2666,48 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       const nextTex = new THREE.CanvasTexture(customOrthoCanvas);
       nextTex.colorSpace = THREE.SRGBColorSpace;
       nextTex.anisotropy = ctx.maxAniso;
+      nextTex.wrapS = THREE.ClampToEdgeWrapping;
+      nextTex.wrapT = THREE.ClampToEdgeWrapping;
       nextTex.minFilter = THREE.LinearMipmapLinearFilter;
       nextTex.magFilter = THREE.LinearFilter;
+      nextTex.needsUpdate = true;
       ctx.customOrthoTexture = nextTex;
       ctx.orthoMat.map = nextTex;
       ctx.contourBaseMat.map = nextTex;
+      ctx.customOrthoMat.map = nextTex;
     } else {
       ctx.orthoMat.map = ctx.defaultOrthoTexture;
       ctx.contourBaseMat.map = ctx.defaultOrthoTexture;
+      ctx.customOrthoMat.map = null;
     }
     ctx.orthoMat.needsUpdate = true;
     ctx.contourBaseMat.needsUpdate = true;
+    ctx.customOrthoMat.needsUpdate = true;
+
+    ctx.rebuildCustomOrthoPlane();
+    if (!external3DSource && !contourDxfRef.current) {
+      if (customOrthoCanvas && orthoCadTransformRef.current) {
+        ctx.baseGrid.position.y = -0.5;
+        onModelBoundsChangeRef.current?.(
+          orthoPlanBoundsRef.current ? { ...orthoCadTransformRef.current } : null
+        );
+        metersPerUnitRef.current = 1 / Math.max(1e-9, orthoCadTransformRef.current.scaleFactor);
+      } else if (!orthoLoading) {
+        ctx.baseGrid.position.y = -14.2;
+        onModelBoundsChangeRef.current?.(null);
+      }
+    }
+
+    ctx.updateRenderVisibility(renderModeRef.current);
+    ctx.rebuildDxfOverlay();
+
+    if (!external3DSource && !contourDxfRef.current && customOrthoCanvas) {
+      setActivePreset('oblique');
+      computeModelFramingGoal('oblique', exaggerationRef.current, true);
+    }
+
     ctx.requestRender();
-  }, [customOrthoCanvas]);
+  }, [customOrthoCanvas, orthoPlanBounds, orthoNaturalSize, orthoLoading, external3DSource]);
 
   // React to renderMode, 3D profile & DXF overlay/contour visibility change
   useEffect(() => {
@@ -2430,6 +2737,7 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
     const ctx = sceneRef.current;
     if (!ctx) return;
     ctx.rebuildDxfContourOverlay();
+    ctx.rebuildCustomOrthoPlane();
     if (!external3DSource) {
       if (contourDxf && contourCadTransformRef.current) {
         ctx.baseGrid.position.y = -0.5;
@@ -2445,12 +2753,19 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         setRefPlaneElevM(Math.round(((cMinZ + cMaxZ) * 0.5) * 10) / 10);
         setActivePreset('oblique');
         computeModelFramingGoal('oblique', exaggerationRef.current, true);
+      } else if (customOrthoCanvasRef.current && orthoCadTransformRef.current) {
+        ctx.baseGrid.position.y = -0.5;
+        onModelBoundsChangeRef.current?.(
+          orthoPlanBoundsRef.current ? { ...orthoCadTransformRef.current } : null
+        );
+        metersPerUnitRef.current = 1 / Math.max(1e-9, orthoCadTransformRef.current.scaleFactor);
       } else {
         ctx.baseGrid.position.y = -14.2;
         onModelBoundsChangeRef.current?.(null);
       }
     }
     ctx.updateRenderVisibility(renderModeRef.current);
+    ctx.rebuildDxfOverlay();
     ctx.requestRender();
   }, [contourDxf, external3DSource]);
 
@@ -2619,7 +2934,8 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
   const loadingOverlayState = useMemo(() => {
     const active3D = externalLoading;
     const activeDxf = Boolean(contourDxfLoading);
-    if (!active3D && !activeDxf) return null;
+    const activeOrtho = Boolean(orthoLoading) && (renderMode === 'ortofoto' || (!external3DSource && !contourDxf));
+    if (!active3D && !activeDxf && !activeOrtho) return null;
 
     if (active3D && activeDxf) {
       const p3d = externalProgress?.percent ?? null;
@@ -2657,21 +2973,36 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
       };
     }
 
+    if (activeDxf) {
+      return {
+        title: 'Cargando curvado DXF...',
+        fileName: contourDxfFileName ?? 'Curvado.dxf',
+        stageLabel: contourDxfProgress?.stageLabel ?? 'Descargando curvas de nivel DXF...',
+        percent: contourDxfProgress?.percent ?? null,
+        loadedBytes: contourDxfProgress?.loadedBytes ?? 0,
+        totalBytes: contourDxfProgress?.totalBytes ?? null,
+      };
+    }
+
     return {
-      title: 'Cargando curvado DXF...',
-      fileName: contourDxfFileName ?? 'Curvado.dxf',
-      stageLabel: contourDxfProgress?.stageLabel ?? 'Descargando curvas de nivel DXF...',
-      percent: contourDxfProgress?.percent ?? null,
-      loadedBytes: contourDxfProgress?.loadedBytes ?? 0,
-      totalBytes: contourDxfProgress?.totalBytes ?? null,
+      title: 'Cargando ortofoto RGB...',
+      fileName: orthoFileName ?? 'Ortofoto',
+      stageLabel: 'Descargando y georreferenciando ortofoto RGB...',
+      percent: null,
+      loadedBytes: 0,
+      totalBytes: null,
     };
   }, [
     externalLoading,
     externalProgress,
-    external3DSource?.fileName,
+    external3DSource,
     contourDxfLoading,
     contourDxfProgress,
     contourDxfFileName,
+    contourDxf,
+    orthoLoading,
+    orthoFileName,
+    renderMode,
   ]);
 
   return (
@@ -2771,6 +3102,24 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
         </div>
       )}
 
+      {!externalError && orthoError && renderMode === 'ortofoto' && !external3DSource && !contourDxf && (
+        <div className="absolute inset-0 bg-[#090d16]/90 flex items-center justify-center z-40 p-4">
+          <div className="text-center space-y-3 p-6 rounded-xl border border-red-500/40 bg-[#111827] max-w-md">
+            <p className="text-sm font-bold text-red-300">No se pudo cargar la Ortofoto RGB</p>
+            <p className="text-xs text-gray-300 leading-relaxed">{orthoError}</p>
+            {onRetryOrtho && (
+              <button
+                type="button"
+                onClick={onRetryOrtho}
+                className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold cursor-pointer"
+              >
+                Reintentar carga
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* TOP-LEFT OVERLAY: Site Badge & Quick Stockpile Pins */}
       <div className="absolute top-3 left-3 z-20 flex flex-col gap-2 max-w-[280px] pointer-events-none">
         <div className="pointer-events-auto bg-[#0b0f17]/92 border border-gray-800 rounded-xl px-3 py-2 shadow-lg">
@@ -2782,6 +3131,8 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
                   ? external3DSource.label
                   : contourDxf
                   ? contourDxf.fileName
+                  : customOrthoCanvas && orthoFileName
+                  ? orthoFileName
                   : quarry?.name || 'Modelo Digital de Elevaciones'}
               </div>
               <div className="text-[10px] font-mono text-gray-400 truncate">
@@ -2793,12 +3144,35 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
                     } pts`
                   : contourDxf
                   ? `Curvado DXF · ${formatEsInt(contourDxf.polylines.length)} curvas`
+                  : customOrthoCanvas && orthoNaturalSize
+                  ? `Ortofoto RGB · ${formatEsInt(orthoNaturalSize.width)}×${formatEsInt(orthoNaturalSize.height)} px`
                   : activeFlight
                   ? `${activeFlight.flightCode} · ${formatDateEu(activeFlight.surveyDate)}`
                   : `MDE 400×400 m · ${formatElevM(zMinM)}–${formatElevM(zMaxM)} m`}
               </div>
             </div>
           </div>
+
+          {customOrthoCanvas && orthoFileName && (external3DSource || contourDxf) && (
+            <div className="mt-1.5 text-[10px] font-mono text-emerald-300/90 truncate" title={orthoFileName}>
+              Ortofoto RGB: {orthoFileName}
+            </div>
+          )}
+
+          {orthoError && (external3DSource || contourDxf) && renderMode === 'ortofoto' && (
+            <div className="mt-1.5 text-[10px] text-amber-300 bg-amber-500/10 border border-amber-500/35 rounded px-2 py-1 flex items-center justify-between gap-2">
+              <span className="truncate" title={orthoError}>{orthoError}</span>
+              {onRetryOrtho && (
+                <button
+                  type="button"
+                  onClick={onRetryOrtho}
+                  className="text-cyan-300 hover:text-white font-semibold shrink-0 cursor-pointer"
+                >
+                  Reintentar
+                </button>
+              )}
+            </div>
+          )}
 
           {contourDxf && external3DSource && (
             <div className="mt-1.5 text-[10px] font-mono text-amber-300/90 truncate" title={contourDxf.fileName}>
@@ -2835,8 +3209,16 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
                       ctx.externalAsset.setZUpOrientation(nextZUp);
                       ctx.externalAsset.setHypsometricMode(renderMode === 'hipsometria');
                       ctx.externalAsset.setWireframeMode(renderMode === 'tin');
+                      ctx.externalAsset.setOrthophotoOverlay(
+                        renderMode === 'ortofoto' && ctx.customOrthoTexture
+                          ? ctx.customOrthoTexture
+                          : null,
+                        orthoPlanBoundsRef.current,
+                        customOrthoCanvasRef.current
+                      );
                       syncAutoZFromExternalAsset(ctx.externalAsset);
                       onModelBoundsChangeRef.current?.({ ...ctx.externalAsset.cadTransform });
+                      ctx.rebuildCustomOrthoPlane();
                       ctx.rebuildDrawOverlay();
                       ctx.rebuildDxfOverlay();
                       ctx.rebuildDxfContourOverlay();
@@ -4043,10 +4425,10 @@ export const Quarry3DViewer: React.FC<Quarry3DViewerProps> = ({
                             ? 'bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border-cyan-500/45'
                             : 'bg-[#111827] hover:bg-gray-800 text-gray-400 hover:text-white border-gray-700'
                         }`}
-                        title="Mostrar u ocultar perímetros DXF 3D superpuestos"
+                        title={`Mostrar u ocultar Acopio 3D superpuesto (${dxfOverlay.polygons.filter((p) => p.visible !== false).length})`}
                       >
                         {showDxfOverlay ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
-                        <span>DXF 3D ({dxfOverlay.polygons.filter((p) => p.visible !== false).length})</span>
+                        <span>Acopio 3D</span>
                       </button>
                     )}
                     {(renderMode === 'dxf' || showDxfOverlay) && (

@@ -113,6 +113,72 @@ interface RawContourEntity {
   avgZ: number;
 }
 
+interface ContourBlockDef {
+  name: string;
+  base: DxfContourPoint;
+  entities: RawContourEntity[];
+}
+
+interface ContourInsertRef {
+  blockName: string;
+  layer: string;
+  aci?: number;
+  x: number;
+  y: number;
+  z: number;
+  sx: number;
+  sy: number;
+  sz: number;
+  rotDeg: number;
+}
+
+/** AutoCAD Arbitrary Axis Algorithm: converts Object Coordinate System (OCS) point to WCS */
+function ocsToWcs(
+  ox: number,
+  oy: number,
+  oz: number,
+  nx: number,
+  ny: number,
+  nz: number
+): DxfContourPoint {
+  if (Math.abs(nx) < 1e-6 && Math.abs(ny) < 1e-6 && Math.abs(nz - 1) < 1e-6) {
+    return { x: ox, y: oy, z: oz };
+  }
+  const nLen = Math.hypot(nx, ny, nz) || 1;
+  const azx = nx / nLen;
+  const azy = ny / nLen;
+  const azz = nz / nLen;
+
+  let axx: number;
+  let axy: number;
+  let axz: number;
+  if (Math.abs(azx) < 1 / 64 && Math.abs(azy) < 1 / 64) {
+    // Wy x Az -> (azz, 0, -azx)
+    axx = azz;
+    axy = 0;
+    axz = -azx;
+  } else {
+    // Wz x Az -> (-azy, azx, 0)
+    axx = -azy;
+    axy = azx;
+    axz = 0;
+  }
+  const axLen = Math.hypot(axx, axy, axz) || 1;
+  axx /= axLen;
+  axy /= axLen;
+  axz /= axLen;
+
+  const ayx = azy * axz - azz * axy;
+  const ayy = azz * axx - azx * axz;
+  const ayz = azx * axy - azy * axx;
+
+  return {
+    x: ox * axx + oy * ayx + oz * azx,
+    y: ox * axy + oy * ayy + oz * azy,
+    z: ox * axz + oy * ayz + oz * azz,
+  };
+}
+
 function tokenizeDxfPairs(dxfText: string): DxfPair[] {
   const cleanText = dxfText.replace(/^\uFEFF/, '');
   if (cleanText.slice(0, 32).includes('AutoCAD Binary DXF')) {
@@ -195,26 +261,46 @@ function parseLayerAciColors(pairs: DxfPair[]): Map<string, number> {
   return layerColors;
 }
 
-function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 'BLOCKS'): RawContourEntity[] {
+function extractContoursAndBlocks(pairs: DxfPair[]): {
+  entities: RawContourEntity[];
+  blocks: Map<string, ContourBlockDef>;
+  inserts: ContourInsertRef[];
+} {
   const entities: RawContourEntity[] = [];
+  const blocks = new Map<string, ContourBlockDef>();
+  const inserts: ContourInsertRef[] = [];
 
-  let inTargetSection = false;
+  let activeSection: '' | 'ENTITIES' | 'BLOCKS' = '';
+  let curBlock: ContourBlockDef | null = null;
   let idx = 0;
+
+  const pushEntity = (ent: RawContourEntity) => {
+    if (activeSection === 'BLOCKS' && curBlock) {
+      curBlock.entities.push(ent);
+    } else if (activeSection === 'ENTITIES') {
+      entities.push(ent);
+    }
+  };
 
   while (idx < pairs.length) {
     const p = pairs[idx];
     if (p.code === 0 && p.value === 'SECTION') {
       const secName = pairs[idx + 1]?.code === 2 ? pairs[idx + 1].value.toUpperCase() : '';
-      inTargetSection = secName === sectionFilter;
+      activeSection = secName === 'ENTITIES' ? 'ENTITIES' : secName === 'BLOCKS' ? 'BLOCKS' : '';
+      curBlock = null;
       idx += 2;
       continue;
     }
     if (p.code === 0 && p.value === 'ENDSEC') {
-      inTargetSection = false;
+      if (curBlock && curBlock.name) {
+        blocks.set(curBlock.name, curBlock);
+      }
+      curBlock = null;
+      activeSection = '';
       idx += 1;
       continue;
     }
-    if (!inTargetSection) {
+    if (!activeSection) {
       idx += 1;
       continue;
     }
@@ -227,11 +313,49 @@ function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 
     const entityType = p.value.toUpperCase();
     idx += 1;
 
+    if (activeSection === 'BLOCKS' && entityType === 'BLOCK') {
+      let name = '';
+      let bx = 0;
+      let by = 0;
+      let bz = 0;
+      while (idx < pairs.length && pairs[idx].code !== 0) {
+        const { code, value } = pairs[idx];
+        if (code === 2) name = value;
+        else if (code === 10) bx = parseFloat(value) || 0;
+        else if (code === 20) by = parseFloat(value) || 0;
+        else if (code === 30) bz = parseFloat(value) || 0;
+        idx += 1;
+      }
+      curBlock = { name, base: { x: bx, y: by, z: bz }, entities: [] };
+      continue;
+    }
+
+    if (activeSection === 'BLOCKS' && entityType === 'ENDBLK') {
+      if (curBlock && curBlock.name) {
+        blocks.set(curBlock.name, curBlock);
+      }
+      curBlock = null;
+      while (idx < pairs.length && pairs[idx].code !== 0) {
+        idx += 1;
+      }
+      continue;
+    }
+
+    if (activeSection === 'BLOCKS' && !curBlock) {
+      while (idx < pairs.length && pairs[idx].code !== 0) {
+        idx += 1;
+      }
+      continue;
+    }
+
     if (entityType === 'LWPOLYLINE') {
       let layer = '0';
       let aci: number | undefined;
       let flags = 0;
       let constElev = 0;
+      let nx = 0;
+      let ny = 0;
+      let nz = 1;
       const rawPts: Array<{ x: number; y: number; z?: number }> = [];
       let curX: number | null = null;
       let curY: number | null = null;
@@ -257,6 +381,15 @@ function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 
         } else if (code === 38) {
           const n = parseFloat(value);
           if (Number.isFinite(n)) constElev = n;
+        } else if (code === 210) {
+          const n = parseFloat(value);
+          if (Number.isFinite(n)) nx = n;
+        } else if (code === 220) {
+          const n = parseFloat(value);
+          if (Number.isFinite(n)) ny = n;
+        } else if (code === 230) {
+          const n = parseFloat(value);
+          if (Number.isFinite(n)) nz = n;
         } else if (code === 10) {
           flushVertex();
           const n = parseFloat(value);
@@ -273,13 +406,12 @@ function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 
       flushVertex();
 
       if (rawPts.length >= 2) {
-        const points = rawPts.map((pt) => ({
-          x: pt.x,
-          y: pt.y,
-          z: pt.z !== undefined && Number.isFinite(pt.z) ? pt.z : constElev,
-        }));
+        const points = rawPts.map((pt) => {
+          const elev = pt.z !== undefined && Number.isFinite(pt.z) ? pt.z : constElev;
+          return ocsToWcs(pt.x, pt.y, elev, nx, ny, nz);
+        });
         const avgZ = points.reduce((acc, pt) => acc + pt.z, 0) / points.length;
-        entities.push({
+        pushEntity({
           layer,
           aci,
           closed: (flags & 1) === 1,
@@ -295,6 +427,9 @@ function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 
       let aci: number | undefined;
       let flags = 0;
       let defaultZ = 0;
+      let nx = 0;
+      let ny = 0;
+      let nz = 1;
 
       while (idx < pairs.length && pairs[idx].code !== 0) {
         const { code, value } = pairs[idx];
@@ -307,10 +442,20 @@ function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 
         } else if (code === 30) {
           const n = parseFloat(value);
           if (Number.isFinite(n)) defaultZ = n;
+        } else if (code === 210) {
+          const n = parseFloat(value);
+          if (Number.isFinite(n)) nx = n;
+        } else if (code === 220) {
+          const n = parseFloat(value);
+          if (Number.isFinite(n)) ny = n;
+        } else if (code === 230) {
+          const n = parseFloat(value);
+          if (Number.isFinite(n)) nz = n;
         }
         idx += 1;
       }
 
+      const is3DPolyline = (flags & 8) !== 0;
       const isMeshOrPolyface = (flags & 16) !== 0 || (flags & 64) !== 0;
       const pts: DxfContourPoint[] = [];
 
@@ -336,11 +481,8 @@ function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 
           }
           const isControlOrFace = (vFlags & 64) !== 0 || (vFlags & 16) !== 0 || (vFlags & 128) !== 0;
           if (!isMeshOrPolyface && !isControlOrFace && vx !== null && vy !== null && Number.isFinite(vx) && Number.isFinite(vy)) {
-            pts.push({
-              x: vx,
-              y: vy,
-              z: vz !== undefined && Number.isFinite(vz) ? vz : defaultZ,
-            });
+            const rawZ = vz !== undefined && Number.isFinite(vz) ? vz : defaultZ;
+            pts.push(is3DPolyline ? { x: vx, y: vy, z: rawZ } : ocsToWcs(vx, vy, rawZ, nx, ny, nz));
           }
           continue;
         }
@@ -350,7 +492,7 @@ function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 
 
       if (!isMeshOrPolyface && pts.length >= 2) {
         const avgZ = pts.reduce((acc, pt) => acc + pt.z, 0) / pts.length;
-        entities.push({
+        pushEntity({
           layer,
           aci,
           closed: (flags & 1) === 1,
@@ -401,7 +543,7 @@ function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 
         Number.isFinite(x2) &&
         Number.isFinite(y2)
       ) {
-        entities.push({
+        pushEntity({
           layer,
           aci,
           closed: false,
@@ -478,12 +620,65 @@ function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 
       const chosen = fitPts.length >= 2 ? fitPts : ctrlPts;
       if (chosen.length >= 2) {
         const avgZ = chosen.reduce((acc, pt) => acc + pt.z, 0) / chosen.length;
-        entities.push({
+        pushEntity({
           layer,
           aci,
           closed: (flags & 1) === 1,
           points: chosen,
           avgZ,
+        });
+      }
+      continue;
+    }
+
+    if (entityType === 'INSERT' && activeSection === 'ENTITIES') {
+      let blockName = '';
+      let layer = '0';
+      let aci: number | undefined;
+      let ix = 0;
+      let iy = 0;
+      let iz = 0;
+      let sx = 1;
+      let sy = 1;
+      let sz = 1;
+      let rotDeg = 0;
+      let nx = 0;
+      let ny = 0;
+      let nz = 1;
+
+      while (idx < pairs.length && pairs[idx].code !== 0) {
+        const { code, value } = pairs[idx];
+        if (code === 2) blockName = value;
+        else if (code === 8) layer = value || '0';
+        else if (code === 62) {
+          const n = parseInt(value, 10);
+          if (Number.isFinite(n)) aci = n;
+        } else if (code === 10) ix = parseFloat(value) || 0;
+        else if (code === 20) iy = parseFloat(value) || 0;
+        else if (code === 30) iz = parseFloat(value) || 0;
+        else if (code === 41) sx = parseFloat(value) || 1;
+        else if (code === 42) sy = parseFloat(value) || 1;
+        else if (code === 43) sz = parseFloat(value) || 1;
+        else if (code === 50) rotDeg = parseFloat(value) || 0;
+        else if (code === 210) nx = parseFloat(value) || 0;
+        else if (code === 220) ny = parseFloat(value) || 0;
+        else if (code === 230) nz = parseFloat(value) || 1;
+        idx += 1;
+      }
+
+      if (blockName) {
+        const wcsPos = ocsToWcs(ix, iy, iz, nx, ny, nz);
+        inserts.push({
+          blockName,
+          layer,
+          aci,
+          x: wcsPos.x,
+          y: wcsPos.y,
+          z: wcsPos.z,
+          sx,
+          sy,
+          sz,
+          rotDeg,
         });
       }
       continue;
@@ -495,16 +690,50 @@ function extractEntitiesFromPairs(pairs: DxfPair[], sectionFilter: 'ENTITIES' | 
     }
   }
 
-  return entities;
+  return { entities, blocks, inserts };
 }
 
 export function parseDxfContoursText(dxfText: string, fileName: string): ParsedDxfContours {
   const pairs = tokenizeDxfPairs(dxfText);
   const layerColors = parseLayerAciColors(pairs);
 
-  let rawEntities = extractEntitiesFromPairs(pairs, 'ENTITIES');
+  const { entities, blocks, inserts } = extractContoursAndBlocks(pairs);
+  const rawEntities: RawContourEntity[] = [...entities];
+
+  for (const ins of inserts) {
+    const blk = blocks.get(ins.blockName);
+    if (!blk || blk.entities.length === 0) continue;
+    const rad = (ins.rotDeg * Math.PI) / 180;
+    const cosR = Math.cos(rad);
+    const sinR = Math.sin(rad);
+    for (const ent of blk.entities) {
+      const xformPts = ent.points.map((pt) => {
+        const lx = (pt.x - blk.base.x) * ins.sx;
+        const ly = (pt.y - blk.base.y) * ins.sy;
+        const lz = (pt.z - blk.base.z) * ins.sz;
+        return {
+          x: ins.x + lx * cosR - ly * sinR,
+          y: ins.y + lx * sinR + ly * cosR,
+          z: ins.z + lz,
+        };
+      });
+      const avgZ = xformPts.reduce((acc, p) => acc + p.z, 0) / xformPts.length;
+      rawEntities.push({
+        layer: ent.layer === '0' ? ins.layer : ent.layer,
+        aci: ent.aci ?? ins.aci,
+        closed: ent.closed,
+        points: xformPts,
+        avgZ,
+      });
+    }
+  }
+
+  // Fallback only if ENTITIES and INSERTs yielded nothing: inspect non-system BLOCK definitions
   if (rawEntities.length === 0) {
-    rawEntities = extractEntitiesFromPairs(pairs, 'BLOCKS');
+    for (const [blkName, blk] of blocks.entries()) {
+      if (blkName.startsWith('*')) continue;
+      rawEntities.push(...blk.entities);
+    }
   }
 
   if (rawEntities.length === 0) {
