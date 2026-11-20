@@ -1,20 +1,19 @@
 # ==============================================================================
 # DOCKER COMPOSE — PORTAL INGEODRON v5.50
 # Instalación y compilación directa desde GitHub usando Dockerfile
-# Repositorio: https://github.com/vpolooro/Ingeodron_Ver5.10.git
+# Repositorio: https://github.com/vpolooro/Ingeodron_V5.50.git
 # ==============================================================================
-# Instalar y arrancar en local con el código del proyecto:
+# Instalar y arrancar desde GitHub (repositorio público):
 #   docker compose up -d --build
 #
-# Compilar y subir a un registro (Docker Hub / GHCR):
-#   DOCKER_IMAGE=tuusuario/ingeodron-portal:5.50 docker compose build
-#   DOCKER_IMAGE=tuusuario/ingeodron-portal:5.50 docker compose push
+# Actualizar a la última versión de GitHub (forzar recompilación):
+#   docker compose build --no-cache && docker compose up -d
 #
-# Compilar directamente desde GitHub:
-#   GIT_BUILD_CONTEXT="https://github.com/vpolooro/Ingeodron_Ver5.10.git#main" docker compose up -d --build
+# Compilar usando los archivos locales en lugar de GitHub:
+#   GIT_BUILD_CONTEXT=. docker compose up -d --build
 #
 # Si el repositorio es privado, define GIT_BUILD_CONTEXT con tu token:
-#   GIT_BUILD_CONTEXT="https://<GITHUB_TOKEN>@github.com/vpolooro/Ingeodron_Ver5.10.git#main" docker compose up -d --build
+#   GIT_BUILD_CONTEXT="https://<GITHUB_TOKEN>@github.com/vpolooro/Ingeodron_V5.50.git#main" docker compose up -d --build
 # (o usa docker-compose.git.yml pasando GITHUB_TOKEN como variable de entorno)
 #
 # (Opcional) Levantar con HTTPS automático (Caddy + Let's Encrypt):
@@ -27,7 +26,7 @@
 services:
   ingeodron-portal:
     build:
-      context: ${GIT_BUILD_CONTEXT:-.}
+      context: ${GIT_BUILD_CONTEXT:-https://github.com/vpolooro/Ingeodron_V5.50.git#main}
       dockerfile: Dockerfile
     image: ${DOCKER_IMAGE:-ingeodron-portal:5.50}
     container_name: ingeodron-portal

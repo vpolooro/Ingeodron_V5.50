@@ -1,6 +1,6 @@
 # Manual de Instalación y Despliegue en Docker — Portal INGEODRON (v5.50)
 
-Guía completa para instalar y ejecutar la aplicación en **Docker** directamente desde GitHub (`https://github.com/vpolooro/Ingeodron_Ver5.10.git`) mediante **Docker Compose**.
+Guía completa para instalar y ejecutar la aplicación en **Docker** directamente desde GitHub (`https://github.com/vpolooro/Ingeodron_V5.50.git`) mediante **Docker** y **Docker Compose**.
 
 ---
 
@@ -10,7 +10,7 @@ Guía completa para instalar y ejecutar la aplicación en **Docker** directament
   1. **Etapa 1 (`builder`)**: Instala dependencias y compila el frontend React con Vite (`dist/`).
   2. **Etapa 2 (`runner`)**: Imagen ligera con Node 22 que ejecuta el servidor Express (`server.ts`), sirve la SPA compilada y gestiona `/api/*`, `/files/*` y `/app/storage`.
 - **`.dockerignore`**: Excluye `node_modules`, `dist`, `.git`, `.env` y `storage` para acelerar la compilación.
-- **`docker-compose.yml`**: Construye la imagen `ingeodron-portal:5.50` desde el directorio actual (`.`) usando el `Dockerfile` (o desde GitHub pasando `GIT_BUILD_CONTEXT`), expone el puerto `3000`, monta el volumen persistente `./storage:/app/storage` y configura `healthcheck`.
+- **`docker-compose.yml`**: Construye la imagen `ingeodron-portal:5.50` directamente desde GitHub (`https://github.com/vpolooro/Ingeodron_V5.50.git#main`) usando el `Dockerfile`, expone el puerto `3000`, monta el volumen persistente `./storage:/app/storage` y configura `healthcheck`.
 - **`docker-compose.git.yml`**: Alternativa pensada para **Portainer / Synology / repositorios privados**, que clona y compila al arrancar usando la variable `GITHUB_TOKEN` y soporta `AUTO_UPDATE=true`.
 - **`docker-compose.https.yml`**: Extensión opcional con proxy inverso **Caddy** y HTTPS automático (Let's Encrypt).
 - **`.env.example`**: Plantilla de variables de entorno (`APP_PORT`, `APP_URL`, `SESSION_SECRET`, etc.).
@@ -30,11 +30,11 @@ docker compose version
 
 ---
 
-## 3. Instalación y Despliegue en Docker
+## 3. Instalación en Docker desde GitHub
 
-### Opción A: Compilar y arrancar en local con `docker-compose.yml` (Recomendado)
+### Opción A: Compilación directa desde GitHub con `docker-compose.yml` (Recomendado)
 
-Desde la carpeta raíz del proyecto:
+Solo necesitas el archivo `docker-compose.yml` en tu servidor (el `Dockerfile` y el código fuente se obtienen directamente desde `https://github.com/vpolooro/Ingeodron_V5.50.git#main`):
 
 ```bash
 docker compose up -d --build
@@ -42,26 +42,23 @@ docker compose up -d --build
 
 La aplicación quedará disponible en **`http://localhost:3000`**.
 
-Si quieres compilar directamente desde GitHub en lugar de usar los archivos locales:
+Para actualizar posteriormente a una nueva versión subida a GitHub:
 
 ```bash
-GIT_BUILD_CONTEXT="https://github.com/vpolooro/Ingeodron_Ver5.10.git#main" docker compose up -d --build
+docker compose build --no-cache && docker compose up -d
 ```
 
-### Opción B: Construir la imagen y subirla a Docker Hub / Registry
+Si quieres compilar usando una copia local del repositorio en lugar de GitHub:
 
 ```bash
-docker build -t tuusuario/ingeodron-portal:5.50 .
-docker login
-docker push tuusuario/ingeodron-portal:5.50
+GIT_BUILD_CONTEXT=. docker compose up -d --build
 ```
 
-O exportar la imagen en un archivo `.tar` para llevarla a otro servidor sin conexión:
+### Opción B: Compilación directa con `docker build` desde GitHub
 
 ```bash
-docker save -o ingeodron-portal-5.50.tar ingeodron-portal:5.50
-# En el servidor de destino:
-docker load -i ingeodron-portal-5.50.tar
+docker build -t ingeodron-portal:5.50 https://github.com/vpolooro/Ingeodron_V5.50.git#main
+docker run -d --name ingeodron-portal -p 3000:3000 -v $(pwd)/storage:/app/storage --restart unless-stopped ingeodron-portal:5.50
 ```
 
 ---
@@ -83,7 +80,7 @@ Si el repositorio es **privado** o despliegas desde Portainer / Synology Contain
 
 ---
 
-### Opción C: Con dominio propio y HTTPS automático (Let's Encrypt)
+### Opción D: Con dominio propio y HTTPS automático (Let's Encrypt)
 
 ```bash
 DOMAIN=portal.tudominio.es SESSION_SECRET="tu_clave_segura" docker compose -f docker-compose.yml -f docker-compose.https.yml up -d --build
@@ -95,7 +92,7 @@ DOMAIN=portal.tudominio.es SESSION_SECRET="tu_clave_segura" docker compose -f do
 
 | Acción | Comando |
 | :--- | :--- |
-| Instalar / compilar y arrancar | `docker compose up -d --build` |
+| Instalar / compilar y arrancar desde GitHub | `docker compose up -d --build` |
 | Ver estado y healthcheck | `docker compose ps` |
 | Ver logs en tiempo real | `docker compose logs -f ingeodron-portal` |
 | Reiniciar contenedor | `docker compose restart` |

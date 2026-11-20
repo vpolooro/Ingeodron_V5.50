@@ -1,9 +1,9 @@
 # ==============================================================================
 # DOCKERFILE MULTI-STAGE — PORTAL INGEODRON (v5.50)
+# Compilación directa desde GitHub:
+#   docker build -t ingeodron-portal:5.50 https://github.com/vpolooro/Ingeodron_V5.50.git#main
 # Compilación local:
 #   docker build -t ingeodron-portal:5.50 .
-# Compilación directa desde GitHub:
-#   docker build -t ingeodron-portal:5.50 https://github.com/vpolooro/Ingeodron_Ver5.10.git#main
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -35,7 +35,7 @@ ENV PORT=3000
 ENV FILES_ROOT_DIR=/app/storage
 ENV NODE_OPTIONS=--max-old-space-size=1536
 
-# Copiar dependencias y artefactos compilados desde la etapa builder
+# Copiar dependencias, artefactos compilados y servidor con sus módulos TypeScript
 COPY --from=builder /app/package.json ./package.json
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
